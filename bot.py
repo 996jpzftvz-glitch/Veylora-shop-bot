@@ -29,6 +29,11 @@ SUPPORT_URL = "https://t.me/srkhnv"
 
 DB_NAME = "shop.db"
 
+# ПРОМОКОД
+PROMO_CODE = "VEYLO5"
+PROMO_DISCOUNT = 5
+PROMO_LIMIT = 3
+
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
@@ -53,6 +58,8 @@ def init_db():
             status TEXT NOT NULL,
             receipt TEXT,
             wallet TEXT,
+            promo_code TEXT,
+            discount INTEGER DEFAULT 0,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
@@ -77,6 +84,16 @@ def init_db():
             "ALTER TABLE orders ADD COLUMN wallet TEXT"
         )
 
+    if "promo_code" not in column_names:
+        db.execute(
+            "ALTER TABLE orders ADD COLUMN promo_code TEXT"
+        )
+
+    if "discount" not in column_names:
+        db.execute(
+            "ALTER TABLE orders ADD COLUMN discount INTEGER DEFAULT 0"
+        )
+
     db.commit()
 
 
@@ -93,6 +110,10 @@ class CustomQuantity(StatesGroup):
 
 
 class GramWallet(StatesGroup):
+    waiting = State()
+
+
+class PromoState(StatesGroup):
     waiting = State()
 
 
@@ -116,6 +137,50 @@ def save_user(user):
     ))
 
     db.commit()
+
+
+# =========================
+# ПРОМОКОДЫ
+# =========================
+
+def get_promo_usage():
+    row = db.execute("""
+        SELECT COUNT(*) AS count
+        FROM orders
+        WHERE promo_code = ?
+    """, (PROMO_CODE,)).fetchone()
+
+    return row["count"]
+
+
+def user_used_promo(user_id):
+    row = db.execute("""
+        SELECT id
+        FROM orders
+        WHERE user_id = ?
+        AND promo_code = ?
+        LIMIT 1
+    """, (
+        user_id,
+        PROMO_CODE
+    )).fetchone()
+
+    return row is not None
+
+
+def calculate_discount(price):
+    discount = (
+        Decimal(price)
+        * Decimal(PROMO_DISCOUNT)
+        / Decimal("100")
+    )
+
+    return int(
+        discount.quantize(
+            Decimal("1"),
+            rounding=ROUND_HALF_UP
+        )
+    )
 
 
 # =========================
@@ -184,6 +249,33 @@ def save_receipt(order_id, receipt):
     ))
 
     db.commit()
+
+
+def apply_promo_to_order(order_id, promo_code, discount):
+    order = get_order(order_id)
+
+    if not order:
+        return False
+
+    original_price = order["price"]
+    new_price = original_price - discount
+
+    db.execute("""
+        UPDATE orders
+        SET price = ?,
+            promo_code = ?,
+            discount = ?
+        WHERE id = ?
+    """, (
+        new_price,
+        promo_code,
+        discount,
+        order_id,
+    ))
+
+    db.commit()
+
+    return True
 
 
 def get_user_orders(user_id):
@@ -413,6 +505,12 @@ def payment_keyboard(order_id):
         inline_keyboard=[
             [
                 InlineKeyboardButton(
+                    text="🎁 Ввести промокод",
+                    callback_data=f"promo_{order_id}"
+                )
+            ],
+            [
+                InlineKeyboardButton(
                     text="💳 Я оплатил",
                     callback_data=f"paid_{order_id}"
                 )
@@ -622,12 +720,15 @@ async def gram(callback: CallbackQuery):
 
 
 @dp.callback_query(F.data.startswith("gram_"))
-async def gram_purchase(callback: CallbackQuery, state: FSMContext):
+async def gram_purchase(
+    callback: CallbackQuery,
+    state: FSMContext
+):
     quantity = int(
         callback.data.split("_")[1]
     )
 
-    price = quantity * 780
+    price = quantity * 800
 
     await state.update_data(
         quantity=quantity,
@@ -683,7 +784,7 @@ async def custom_gram_amount(
         if quantity <= 0:
             raise ValueError
 
-        price = quantity * 780
+        price = quantity * 800
 
         await state.update_data(
             quantity=quantity,
@@ -859,8 +960,187 @@ async def show_payment(
         f"{wallet_text}\n\n"
         f"💳 Оплата через Kaspi:\n"
         f"{KASPI_NUMBER}\n\n"
+        "При наличии промокода нажмите "
+        "«Ввести промокод».\n\n"
         "После перевода нажмите «Я оплатил» "
-        "и отправьте фото чека.",
+        "и отправьте фото или PDF-чек.",
+        reply_markup=payment_keyboard(order_id)
+    )
+
+
+# =========================
+# ПРОМОКОД
+# =========================
+
+@dp.callback_query(F.data.startswith("promo_"))
+async def promo_start(
+    callback: CallbackQuery,
+    state: FSMContext
+):
+    order_id = int(
+        callback.data.split("_")[1]
+    )
+
+    order = get_order(order_id)
+
+    if not order:
+        await callback.answer(
+            "Заказ не найден.",
+            show_alert=True
+        )
+        return
+
+    if order["user_id"] != callback.from_user.id:
+        await callback.answer(
+            "Это не ваш заказ.",
+            show_alert=True
+        )
+        return
+
+    if order["promo_code"]:
+        await callback.answer(
+            "Промокод уже применён.",
+            show_alert=True
+        )
+        return
+
+    if get_promo_usage() >= PROMO_LIMIT:
+        await callback.answer(
+            "Промокод уже закончился.",
+            show_alert=True
+        )
+        return
+
+    if user_used_promo(callback.from_user.id):
+        await callback.answer(
+            "Вы уже использовали этот промокод.",
+            show_alert=True
+        )
+        return
+
+    await state.set_state(
+        PromoState.waiting
+    )
+
+    await state.update_data(
+        order_id=order_id
+    )
+
+    await callback.message.answer(
+        "🎁 Введите промокод:"
+    )
+
+    await callback.answer()
+
+
+@dp.message(PromoState.waiting)
+async def promo_enter(
+    message: Message,
+    state: FSMContext
+):
+    code = message.text.strip().upper()
+
+    data = await state.get_data()
+    order_id = data.get("order_id")
+
+    if not order_id:
+        await state.clear()
+
+        await message.answer(
+            "Произошла ошибка. Оформите заказ заново."
+        )
+        return
+
+    order = get_order(order_id)
+
+    if not order:
+        await state.clear()
+
+        await message.answer(
+            "Заказ не найден."
+        )
+        return
+
+    if order["user_id"] != message.from_user.id:
+        await state.clear()
+
+        await message.answer(
+            "Это не ваш заказ."
+        )
+        return
+
+    if code != PROMO_CODE:
+        await message.answer(
+            "❌ Неверный промокод.\n\n"
+            "Попробуйте ещё раз."
+        )
+        return
+
+    if order["promo_code"]:
+        await state.clear()
+
+        await message.answer(
+            "Промокод уже применён к этому заказу."
+        )
+        return
+
+    if user_used_promo(message.from_user.id):
+        await state.clear()
+
+        await message.answer(
+            "Вы уже использовали этот промокод."
+        )
+        return
+
+    if get_promo_usage() >= PROMO_LIMIT:
+        await state.clear()
+
+        await message.answer(
+            "❌ Промокод уже закончился.\n\n"
+            "Первые 3 использования уже заняты."
+        )
+        return
+
+    discount = calculate_discount(
+        order["price"]
+    )
+
+    new_price = order["price"] - discount
+
+    success = apply_promo_to_order(
+        order_id,
+        PROMO_CODE,
+        discount
+    )
+
+    if not success:
+        await state.clear()
+
+        await message.answer(
+            "Не удалось применить промокод."
+        )
+        return
+
+    await state.clear()
+
+    wallet_text = ""
+
+    if order["wallet"]:
+        wallet_text = (
+            f"\n\nTON-кошелёк:\n"
+            f"{order['wallet']}"
+        )
+
+    await message.answer(
+        f"🎉 Промокод применён!\n\n"
+        f"Скидка: {PROMO_DISCOUNT}%\n"
+        f"Скидка в деньгах: {discount} ₸\n"
+        f"Новая стоимость: {new_price} ₸"
+        f"{wallet_text}\n\n"
+        f"💳 Оплата через Kaspi:\n"
+        f"{KASPI_NUMBER}\n\n"
+        "После оплаты нажмите «Я оплатил» "
+        "и отправьте фото или PDF-чек.",
         reply_markup=payment_keyboard(order_id)
     )
 
@@ -898,18 +1178,22 @@ async def paid(callback: CallbackQuery):
 
     await callback.message.answer(
         f"Заказ #{order_id}\n\n"
-        "Теперь отправьте сюда фото чека Kaspi."
+        "Теперь отправьте сюда фото чека "
+        "или PDF-файл с чеком Kaspi."
     )
 
     await callback.answer()
 
 
 # =========================
-# ЧЕК
+# ОБЩАЯ ИНФОРМАЦИЯ О ЧЕКЕ
 # =========================
 
-@dp.message(F.photo)
-async def receipt(message: Message):
+async def process_receipt(
+    message: Message,
+    receipt_file_id: str,
+    receipt_type: str
+):
     order = get_active_user_order(
         message.from_user.id
     )
@@ -919,8 +1203,6 @@ async def receipt(message: Message):
             "Сначала оформите заказ."
         )
         return
-
-    receipt_file_id = message.photo[-1].file_id
 
     save_receipt(
         order["id"],
@@ -941,6 +1223,14 @@ async def receipt(message: Message):
             f"{order['wallet']}\n"
         )
 
+    promo_text = ""
+
+    if order["promo_code"]:
+        promo_text = (
+            f"\n🎁 Промокод: {order['promo_code']}\n"
+            f"💸 Скидка: {order['discount']} ₸\n"
+        )
+
     admin_text = (
         f"🧾 НОВЫЙ ЗАКАЗ #{order['id']}\n\n"
         f"👤 Пользователь: {username}\n"
@@ -948,22 +1238,87 @@ async def receipt(message: Message):
         f"📦 Товар: {order['product']}\n"
         f"🔢 Количество: {order['quantity']}\n"
         f"💰 Сумма: {order['price']} ₸\n"
+        f"{promo_text}"
         f"{wallet_text}\n"
+        f"📄 Тип чека: {receipt_type}\n\n"
         "Проверьте оплату."
     )
 
-    await bot.send_photo(
-        ADMIN_ID,
-        receipt_file_id,
-        caption=admin_text,
-        reply_markup=admin_order_keyboard(
-            order["id"]
+    if receipt_type == "Фото":
+        await bot.send_photo(
+            ADMIN_ID,
+            receipt_file_id,
+            caption=admin_text,
+            reply_markup=admin_order_keyboard(
+                order["id"]
+            )
         )
-    )
+
+    else:
+        await bot.send_document(
+            ADMIN_ID,
+            receipt_file_id,
+            caption=admin_text,
+            reply_markup=admin_order_keyboard(
+                order["id"]
+            )
+        )
 
     await message.answer(
         f"Чек по заказу #{order['id']} "
         "отправлен на проверку."
+    )
+
+
+# =========================
+# ЧЕК — ФОТО
+# =========================
+
+@dp.message(F.photo)
+async def receipt_photo(message: Message):
+    receipt_file_id = message.photo[-1].file_id
+
+    await process_receipt(
+        message,
+        receipt_file_id,
+        "Фото"
+    )
+
+
+# =========================
+# ЧЕК — PDF
+# =========================
+
+@dp.message(F.document)
+async def receipt_document(message: Message):
+    if not message.document:
+        return
+
+    mime_type = message.document.mime_type or ""
+
+    file_name = (
+        message.document.file_name
+        or ""
+    ).lower()
+
+    is_pdf = (
+        mime_type == "application/pdf"
+        or file_name.endswith(".pdf")
+    )
+
+    if not is_pdf:
+        await message.answer(
+            "Можно отправить только PDF-файл "
+            "или фото чека."
+        )
+        return
+
+    receipt_file_id = message.document.file_id
+
+    await process_receipt(
+        message,
+        receipt_file_id,
+        "PDF"
     )
 
 
@@ -1016,10 +1371,18 @@ async def admin_new(callback: CallbackQuery):
         text = "📦 Последние заказы\n\n"
 
         for order in rows:
+            promo_text = ""
+
+            if order["promo_code"]:
+                promo_text = (
+                    f"Промокод: {order['promo_code']}\n"
+                )
+
             text += (
                 f"#{order['id']} — {order['product']}\n"
                 f"Количество: {order['quantity']}\n"
                 f"Сумма: {order['price']} ₸\n"
+                f"{promo_text}"
                 f"Статус: {order['status']}\n\n"
             )
 
@@ -1061,11 +1424,20 @@ async def admin_payment(callback: CallbackQuery):
         text = "💳 Ожидают оплаты\n\n"
 
         for order in rows:
+            promo_text = ""
+
+            if order["promo_code"]:
+                promo_text = (
+                    f"Промокод: {order['promo_code']}\n"
+                    f"Скидка: {order['discount']} ₸\n"
+                )
+
             text += (
                 f"#{order['id']}\n"
                 f"Товар: {order['product']}\n"
                 f"Количество: {order['quantity']}\n"
-                f"Сумма: {order['price']} ₸\n\n"
+                f"Сумма: {order['price']} ₸\n"
+                f"{promo_text}\n"
             )
 
     await callback.message.edit_text(
@@ -1158,6 +1530,8 @@ async def admin_stats(callback: CallbackQuery):
         "FROM orders WHERE status = 'approved'"
     ).fetchone()[0]
 
+    promo_uses = get_promo_usage()
+
     await callback.message.edit_text(
         "📊 Статистика\n\n"
         f"👥 Пользователей: {users}\n"
@@ -1165,7 +1539,9 @@ async def admin_stats(callback: CallbackQuery):
         f"✅ Подтверждено: {approved}\n"
         f"🔎 На проверке: {checking}\n"
         f"💳 Ожидают оплаты: {waiting}\n\n"
-        f"💰 Подтверждено на сумму: {revenue} ₸",
+        f"💰 Подтверждено на сумму: {revenue} ₸\n\n"
+        f"🎁 Промокод {PROMO_CODE}: "
+        f"{promo_uses}/{PROMO_LIMIT}",
         reply_markup=admin_keyboard()
     )
 
@@ -1274,14 +1650,22 @@ async def approve(callback: CallbackQuery):
         "📦 Ваш заказ выдан!"
     )
 
-    await callback.message.edit_caption(
-        caption=(
+    try:
+        await callback.message.edit_caption(
+            caption=(
+                f"✅ ЗАКАЗ #{order_id} ПОДТВЕРЖДЁН\n\n"
+                f"Товар: {order['product']}\n"
+                f"Количество: {order['quantity']}\n"
+                f"Сумма: {order['price']} ₸"
+            )
+        )
+    except Exception:
+        await callback.message.edit_text(
             f"✅ ЗАКАЗ #{order_id} ПОДТВЕРЖДЁН\n\n"
             f"Товар: {order['product']}\n"
             f"Количество: {order['quantity']}\n"
             f"Сумма: {order['price']} ₸"
         )
-    )
 
     await callback.answer(
         "Заказ подтверждён."
@@ -1325,13 +1709,20 @@ async def reject(callback: CallbackQuery):
         "Проверьте оплату или обратитесь в поддержку."
     )
 
-    await callback.message.edit_caption(
-        caption=(
+    try:
+        await callback.message.edit_caption(
+            caption=(
+                f"❌ ЗАКАЗ #{order_id} ОТКЛОНЁН\n\n"
+                f"Товар: {order['product']}\n"
+                f"Сумма: {order['price']} ₸"
+            )
+        )
+    except Exception:
+        await callback.message.edit_text(
             f"❌ ЗАКАЗ #{order_id} ОТКЛОНЁН\n\n"
             f"Товар: {order['product']}\n"
             f"Сумма: {order['price']} ₸"
         )
-    )
 
     await callback.answer(
         "Заказ отклонён."
@@ -1372,7 +1763,17 @@ async def my_orders(callback: CallbackQuery):
             f"#{order['id']} — {order['product']}\n"
             f"Количество: {order['quantity']}\n"
             f"Сумма: {order['price']} ₸\n"
-            f"Статус: {statuses.get(order['status'], order['status'])}\n"
+        )
+
+        if order["promo_code"]:
+            text += (
+                f"Промокод: {order['promo_code']}\n"
+                f"Скидка: {order['discount']} ₸\n"
+            )
+
+        text += (
+            f"Статус: "
+            f"{statuses.get(order['status'], order['status'])}\n"
         )
 
         if order["wallet"]:
@@ -1448,10 +1849,11 @@ async def instruction(callback: CallbackQuery):
         "1. Откройте «Магазин».\n"
         "2. Выберите товар.\n"
         "3. Для GRAM укажите TON-кошелёк.\n"
-        "4. Оплатите заказ через Kaspi.\n"
-        "5. Нажмите «Я оплатил».\n"
-        "6. Отправьте фото чека.\n"
-        "7. Дождитесь проверки.\n\n"
+        "4. При наличии введите промокод.\n"
+        "5. Оплатите заказ через Kaspi.\n"
+        "6. Нажмите «Я оплатил».\n"
+        "7. Отправьте фото или PDF-чек.\n"
+        "8. Дождитесь проверки.\n\n"
         "При возникновении проблем "
         "обратитесь в поддержку.",
         reply_markup=main_keyboard()
