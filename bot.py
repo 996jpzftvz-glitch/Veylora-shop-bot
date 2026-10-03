@@ -52,9 +52,24 @@ def init_db():
             price INTEGER NOT NULL,
             status TEXT NOT NULL,
             receipt TEXT,
+            wallet TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
+
+    # Если база была создана старой версией бота,
+    # добавляем колонку wallet.
+    columns = db.execute(
+        "PRAGMA table_info(orders)"
+    ).fetchall()
+
+    column_names = [column["name"] for column in columns]
+
+    if "wallet" not in column_names:
+        db.execute(
+            "ALTER TABLE orders ADD COLUMN wallet TEXT"
+        )
+
     db.commit()
 
 
@@ -70,16 +85,35 @@ class CustomQuantity(StatesGroup):
     gram = State()
 
 
+class GramWallet(StatesGroup):
+    waiting = State()
+
+
 # =========================
 # РАБОТА С ЗАКАЗАМИ
 # =========================
 
-def create_order(user_id, username, product, quantity, price):
+def create_order(
+    user_id,
+    username,
+    product,
+    quantity,
+    price,
+    wallet=None
+):
     cursor = db.execute(
         """
         INSERT INTO orders
-        (user_id, username, product, quantity, price, status)
-        VALUES (?, ?, ?, ?, ?, ?)
+        (
+            user_id,
+            username,
+            product,
+            quantity,
+            price,
+            status,
+            wallet
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?)
         """,
         (
             user_id,
@@ -88,6 +122,7 @@ def create_order(user_id, username, product, quantity, price):
             str(quantity),
             price,
             "awaiting_payment",
+            wallet,
         ),
     )
 
@@ -110,6 +145,7 @@ def update_order_status(order_id, status):
         "UPDATE orders SET status = ? WHERE id = ?",
         (status, order_id),
     )
+
     db.commit()
 
 
@@ -120,8 +156,13 @@ def save_receipt(order_id, receipt):
         SET receipt = ?, status = ?
         WHERE id = ?
         """,
-        (receipt, "checking", order_id),
+        (
+            receipt,
+            "checking",
+            order_id,
+        ),
     )
+
     db.commit()
 
 
@@ -429,7 +470,9 @@ async def stars(callback: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("stars_"))
 async def stars_purchase(callback: CallbackQuery):
-    quantity = int(callback.data.split("_")[1])
+    quantity = int(
+        callback.data.split("_")[1]
+    )
 
     prices = {
         50: 420,
@@ -469,7 +512,9 @@ async def premium(callback: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("premium_"))
 async def premium_purchase(callback: CallbackQuery):
-    months = int(callback.data.split("_")[1])
+    months = int(
+        callback.data.split("_")[1]
+    )
 
     prices = {
         3: 6400,
@@ -505,21 +550,172 @@ async def gram(callback: CallbackQuery):
     await callback.answer()
 
 
+# Покупка готового количества GRAM
 @dp.callback_query(F.data.startswith("gram_"))
 async def gram_purchase(callback: CallbackQuery):
-    quantity = int(callback.data.split("_")[1])
+    quantity = int(
+        callback.data.split("_")[1]
+    )
 
     price = quantity * 780
 
-    await show_payment(
-        callback.message,
-        callback.from_user,
-        "GRAM",
-        quantity,
-        price
+    # Сохраняем выбранное количество
+    # и переводим пользователя на ввод кошелька
+    await callback.message.answer(
+        f"💠 Покупка GRAM\n\n"
+        f"Количество: {quantity}\n"
+        f"Стоимость: {price} ₸\n\n"
+        "Введите ваш TON-кошелёк, "
+        "на который нужно отправить GRAM:"
+    )
+
+    await callback.bot.send_chat_action(
+        callback.from_user.id,
+        "typing"
+    )
+
+    await dp.fsm.get_context(
+        bot=bot,
+        chat_id=callback.from_user.id,
+        user_id=callback.from_user.id
+    )
+
+    # Передаём данные через FSM
+    from aiogram.fsm.context import FSMContext
+
+    state = FSMContext(
+        storage=dp.storage,
+        key=await dp.fsm.get_context(
+            bot=bot,
+            chat_id=callback.from_user.id,
+            user_id=callback.from_user.id
+        ).key
+    )
+
+    await state.update_data(
+        quantity=quantity,
+        price=price
+    )
+
+    await state.set_state(
+        GramWallet.waiting
     )
 
     await callback.answer()
+
+
+# =========================
+# СВОЁ КОЛИЧЕСТВО GRAM
+# =========================
+
+@dp.callback_query(F.data == "custom_gram")
+async def custom_gram(
+    callback: CallbackQuery,
+    state: FSMContext
+):
+    await state.set_state(
+        CustomQuantity.gram
+    )
+
+    await callback.message.answer(
+        "💠 Введите количество GRAM числом.\n\n"
+        "Например: 4, 5 или 10."
+    )
+
+    await callback.answer()
+
+
+@dp.message(CustomQuantity.gram)
+async def custom_gram_amount(
+    message: Message,
+    state: FSMContext
+):
+    try:
+        quantity = int(
+            message.text.strip()
+        )
+
+        if quantity <= 0:
+            raise ValueError
+
+        price = quantity * 780
+
+        await state.clear()
+
+        await state.update_data(
+            quantity=quantity,
+            price=price
+        )
+
+        await state.set_state(
+            GramWallet.waiting
+        )
+
+        await message.answer(
+            f"💠 Покупка GRAM\n\n"
+            f"Количество: {quantity}\n"
+            f"Стоимость: {price} ₸\n\n"
+            "Введите ваш TON-кошелёк, "
+            "на который нужно отправить GRAM:"
+        )
+
+    except ValueError:
+        await message.answer(
+            "Введите целое число больше 0.\n"
+            "Например: 5"
+        )
+
+
+# =========================
+# ПОЛУЧЕНИЕ TON-КОШЕЛЬКА
+# =========================
+
+@dp.message(GramWallet.waiting)
+async def gram_wallet(
+    message: Message,
+    state: FSMContext
+):
+    wallet = message.text.strip()
+
+    if not wallet:
+        await message.answer(
+            "Введите TON-кошелёк."
+        )
+        return
+
+    # Простая проверка длины.
+    # Не принимает совсем короткие строки.
+    if len(wallet) < 20:
+        await message.answer(
+            "Похоже, кошелёк указан неправильно.\n\n"
+            "Отправьте полный TON-адрес."
+        )
+        return
+
+    data = await state.get_data()
+
+    quantity = data.get("quantity")
+    price = data.get("price")
+
+    if not quantity or not price:
+        await state.clear()
+
+        await message.answer(
+            "Произошла ошибка. "
+            "Пожалуйста, оформите заказ заново."
+        )
+        return
+
+    await state.clear()
+
+    await show_payment(
+        message,
+        message.from_user,
+        "GRAM",
+        quantity,
+        price,
+        wallet=wallet
+    )
 
 
 # =========================
@@ -531,7 +727,8 @@ async def show_payment(
     user,
     product,
     quantity,
-    price
+    price,
+    wallet=None
 ):
     username = (
         f"@{user.username}"
@@ -544,19 +741,30 @@ async def show_payment(
         username=username,
         product=product,
         quantity=quantity,
-        price=price
+        price=price,
+        wallet=wallet
     )
+
+    wallet_text = ""
+
+    if wallet:
+        wallet_text = (
+            f"\n\nTON-кошелёк:\n"
+            f"`{wallet}`"
+        )
 
     await message.answer(
         f"🧾 Заказ #{order_id}\n\n"
         f"Товар: {product}\n"
         f"Количество: {quantity}\n"
-        f"Стоимость: {price} ₸\n\n"
+        f"Стоимость: {price} ₸"
+        f"{wallet_text}\n\n"
         f"💳 Оплата через Kaspi:\n"
         f"{KASPI_NUMBER}\n\n"
         "После перевода нажмите «Я оплатил» "
         "и отправьте фото чека.",
-        reply_markup=payment_keyboard(order_id)
+        reply_markup=payment_keyboard(order_id),
+        parse_mode="Markdown"
     )
 
 
@@ -569,7 +777,9 @@ async def custom_stars(
     callback: CallbackQuery,
     state: FSMContext
 ):
-    await state.set_state(CustomQuantity.stars)
+    await state.set_state(
+        CustomQuantity.stars
+    )
 
     await callback.message.answer(
         "⭐ Введите количество Stars числом.\n\n"
@@ -585,13 +795,16 @@ async def custom_stars_amount(
     state: FSMContext
 ):
     try:
-        quantity = int(message.text.strip())
+        quantity = int(
+            message.text.strip()
+        )
 
         if quantity <= 0:
             raise ValueError
 
         raw_price = (
-            Decimal(quantity) * Decimal("8.4")
+            Decimal(quantity)
+            * Decimal("8.4")
         )
 
         price = int(
@@ -619,56 +832,7 @@ async def custom_stars_amount(
 
 
 # =========================
-# СВОЁ КОЛИЧЕСТВО GRAM
-# =========================
-
-@dp.callback_query(F.data == "custom_gram")
-async def custom_gram(
-    callback: CallbackQuery,
-    state: FSMContext
-):
-    await state.set_state(CustomQuantity.gram)
-
-    await callback.message.answer(
-        "💠 Введите количество GRAM числом.\n\n"
-        "Например: 4, 5 или 10."
-    )
-
-    await callback.answer()
-
-
-@dp.message(CustomQuantity.gram)
-async def custom_gram_amount(
-    message: Message,
-    state: FSMContext
-):
-    try:
-        quantity = int(message.text.strip())
-
-        if quantity <= 0:
-            raise ValueError
-
-        price = quantity * 780
-
-        await state.clear()
-
-        await show_payment(
-            message,
-            message.from_user,
-            "GRAM",
-            quantity,
-            price
-        )
-
-    except ValueError:
-        await message.answer(
-            "Введите целое число больше 0.\n"
-            "Например: 5"
-        )
-
-
-# =========================
-# КНОПКА «Я ОПЛАТИЛ»
+# Я ОПЛАТИЛ
 # =========================
 
 @dp.callback_query(F.data.startswith("paid_"))
@@ -715,7 +879,9 @@ async def paid(callback: CallbackQuery):
 async def receipt(message: Message):
     user_id = message.from_user.id
 
-    order = get_active_user_order(user_id)
+    order = get_active_user_order(
+        user_id
+    )
 
     if not order:
         await message.answer(
@@ -736,13 +902,22 @@ async def receipt(message: Message):
         else "без username"
     )
 
+    wallet_text = ""
+
+    if order["wallet"]:
+        wallet_text = (
+            f"\n💎 TON-кошелёк:\n"
+            f"`{order['wallet']}`\n"
+        )
+
     admin_text = (
         f"🧾 НОВЫЙ ЗАКАЗ #{order['id']}\n\n"
         f"👤 Пользователь: {username}\n"
         f"🆔 ID: {user_id}\n\n"
         f"📦 Товар: {order['product']}\n"
         f"🔢 Количество: {order['quantity']}\n"
-        f"💰 Сумма: {order['price']} ₸\n\n"
+        f"💰 Сумма: {order['price']} ₸\n"
+        f"{wallet_text}\n"
         "Проверьте оплату по чеку."
     )
 
@@ -752,7 +927,8 @@ async def receipt(message: Message):
         caption=admin_text,
         reply_markup=admin_order_keyboard(
             order["id"]
-        )
+        ),
+        parse_mode="Markdown"
     )
 
     await message.answer(
@@ -763,7 +939,7 @@ async def receipt(message: Message):
 
 
 # =========================
-# ПОДТВЕРЖДЕНИЕ ЗАКАЗА
+# ПОДТВЕРЖДЕНИЕ
 # =========================
 
 @dp.callback_query(F.data.startswith("approve_"))
@@ -823,7 +999,7 @@ async def approve(callback: CallbackQuery):
 
 
 # =========================
-# ОТКЛОНЕНИЕ ЗАКАЗА
+# ОТКЛОНЕНИЕ
 # =========================
 
 @dp.callback_query(F.data.startswith("reject_"))
@@ -913,8 +1089,15 @@ async def my_orders(callback: CallbackQuery):
             f"#{order['id']} — {order['product']}\n"
             f"Количество: {order['quantity']}\n"
             f"Сумма: {order['price']} ₸\n"
-            f"Статус: {status}\n\n"
+            f"Статус: {status}\n"
         )
+
+        if order["wallet"]:
+            text += (
+                f"TON-кошелёк: {order['wallet']}\n"
+            )
+
+        text += "\n"
 
     await callback.message.edit_text(
         text,
@@ -957,7 +1140,10 @@ async def leaders(callback: CallbackQuery):
             leaders_list,
             start=1
         ):
-            username = user["username"] or "без username"
+            username = (
+                user["username"]
+                or "без username"
+            )
 
             text += (
                 f"{index}. {username}\n"
@@ -983,11 +1169,12 @@ async def instruction(callback: CallbackQuery):
         "📖 Инструкция\n\n"
         "1. Откройте «Магазин».\n"
         "2. Выберите нужный товар.\n"
-        "3. Оплатите заказ через Kaspi.\n"
-        "4. Нажмите «Я оплатил».\n"
-        "5. Отправьте фото чека.\n"
-        "6. Дождитесь проверки оплаты.\n"
-        "7. После подтверждения получите уведомление.\n\n"
+        "3. Для GRAM укажите TON-кошелёк.\n"
+        "4. Оплатите заказ через Kaspi.\n"
+        "5. Нажмите «Я оплатил».\n"
+        "6. Отправьте фото чека.\n"
+        "7. Дождитесь проверки оплаты.\n"
+        "8. После подтверждения получите уведомление.\n\n"
         "Если возникли проблемы — обратитесь в поддержку.",
         reply_markup=main_keyboard()
     )
