@@ -376,19 +376,19 @@ def gram_keyboard():
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="1 GRAM — 780 ₸",
+                    text="1 GRAM — 800 ₸",
                     callback_data="gram_1"
                 )
             ],
             [
                 InlineKeyboardButton(
-                    text="2 GRAM — 1560 ₸",
+                    text="2 GRAM — 1600 ₸",
                     callback_data="gram_2"
                 )
             ],
             [
                 InlineKeyboardButton(
-                    text="3 GRAM — 2340 ₸",
+                    text="3 GRAM — 2400 ₸",
                     callback_data="gram_3"
                 )
             ],
