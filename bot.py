@@ -13,28 +13,37 @@ from aiogram.types import (
     InlineKeyboardButton,
 )
 
+
+# ==========================================
+# НАСТРОЙКИ
+# ==========================================
+
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 KASPI_NUMBER = os.getenv("KASPI_NUMBER", "Не указан")
 
 SHOP_NAME = "Veylora Shop"
 
+CHANNEL_URL = "https://t.me/veylorashopp"
+SUPPORT_URL = "https://t.me/srkhnv"
+
+
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
 
-# =========================
+# ==========================================
 # СОСТОЯНИЯ
-# =========================
+# ==========================================
 
 class CustomQuantity(StatesGroup):
     stars = State()
     gram = State()
 
 
-# =========================
+# ==========================================
 # ЗАКАЗЫ
-# =========================
+# ==========================================
 
 orders = {}
 user_orders = {}
@@ -63,9 +72,9 @@ def create_order(user_id, product, quantity, price):
     return order_id
 
 
-# =========================
-# КЛАВИАТУРЫ
-# =========================
+# ==========================================
+# ГЛАВНОЕ МЕНЮ
+# ==========================================
 
 def main_keyboard():
     return InlineKeyboardMarkup(
@@ -78,19 +87,37 @@ def main_keyboard():
             ],
             [
                 InlineKeyboardButton(
-                    text="📦 Мои покупки",
-                    callback_data="orders"
+                    text="🏆 Таблица лидеров",
+                    callback_data="leaders"
+                ),
+                InlineKeyboardButton(
+                    text="📖 Инструкция",
+                    callback_data="instruction"
                 )
             ],
             [
                 InlineKeyboardButton(
+                    text="📢 Канал",
+                    url=CHANNEL_URL
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="📦 Мои покупки",
+                    callback_data="orders"
+                ),
+                InlineKeyboardButton(
                     text="💬 Поддержка",
-                    callback_data="support"
+                    url=SUPPORT_URL
                 )
             ],
         ]
     )
 
+
+# ==========================================
+# МАГАЗИН
+# ==========================================
 
 def shop_keyboard():
     return InlineKeyboardMarkup(
@@ -127,19 +154,34 @@ def stars_keyboard():
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
-                InlineKeyboardButton(text="50 Stars — 420 ₸", callback_data="stars_50"),
+                InlineKeyboardButton(
+                    text="50 Stars — 420 ₸",
+                    callback_data="stars_50"
+                )
             ],
             [
-                InlineKeyboardButton(text="100 Stars — 840 ₸", callback_data="stars_100"),
+                InlineKeyboardButton(
+                    text="100 Stars — 840 ₸",
+                    callback_data="stars_100"
+                )
             ],
             [
-                InlineKeyboardButton(text="200 Stars — 1680 ₸", callback_data="stars_200"),
+                InlineKeyboardButton(
+                    text="200 Stars — 1680 ₸",
+                    callback_data="stars_200"
+                )
             ],
             [
-                InlineKeyboardButton(text="300 Stars — 2520 ₸", callback_data="stars_300"),
+                InlineKeyboardButton(
+                    text="300 Stars — 2520 ₸",
+                    callback_data="stars_300"
+                )
             ],
             [
-                InlineKeyboardButton(text="400 Stars — 3360 ₸", callback_data="stars_400"),
+                InlineKeyboardButton(
+                    text="400 Stars — 3360 ₸",
+                    callback_data="stars_400"
+                )
             ],
             [
                 InlineKeyboardButton(
@@ -225,6 +267,10 @@ def gram_keyboard():
     )
 
 
+# ==========================================
+# ОПЛАТА
+# ==========================================
+
 def payment_keyboard(order_id):
     return InlineKeyboardMarkup(
         inline_keyboard=[
@@ -244,6 +290,10 @@ def payment_keyboard(order_id):
     )
 
 
+# ==========================================
+# КНОПКИ АДМИНА
+# ==========================================
+
 def admin_order_keyboard(order_id):
     return InlineKeyboardMarkup(
         inline_keyboard=[
@@ -261,42 +311,77 @@ def admin_order_keyboard(order_id):
     )
 
 
-# =========================
+# ==========================================
 # START
-# =========================
+# ==========================================
 
 @dp.message(CommandStart())
 async def start(message: Message):
     await message.answer(
         f"Добро пожаловать в {SHOP_NAME}.\n\n"
-        "Здесь можно приобрести Telegram Stars, Premium и GRAM.\n\n"
+        "Здесь можно приобрести Telegram Stars, "
+        "Premium и GRAM.\n\n"
         "Выберите нужный раздел:",
         reply_markup=main_keyboard()
     )
 
 
-# =========================
+# ==========================================
 # МАГАЗИН
-# =========================
+# ==========================================
 
 @dp.callback_query(F.data == "shop")
 async def shop(callback: CallbackQuery):
     await callback.message.edit_text(
-        "🛍 Магазин\n\nВыберите категорию:",
+        "🛍 Магазин\n\n"
+        "Выберите категорию:",
         reply_markup=shop_keyboard()
     )
     await callback.answer()
 
 
+# ==========================================
+# STARS
+# ==========================================
+
 @dp.callback_query(F.data == "category_stars")
 async def stars(callback: CallbackQuery):
     await callback.message.edit_text(
         "⭐ Telegram Stars\n\n"
-        "Выберите количество:",
+        "Выберите количество Stars:",
         reply_markup=stars_keyboard()
     )
     await callback.answer()
 
+
+@dp.callback_query(F.data.startswith("stars_"))
+async def stars_purchase(callback: CallbackQuery):
+    quantity = int(callback.data.split("_")[1])
+
+    prices = {
+        50: 420,
+        100: 840,
+        200: 1680,
+        300: 2520,
+        400: 3360,
+    }
+
+    price = prices[quantity]
+
+    await show_payment(
+        callback.message,
+        callback.from_user.id,
+        "Telegram Stars",
+        quantity,
+        price
+    )
+
+    await callback.answer()
+
+
+# ==========================================
+# PREMIUM
+# ==========================================
 
 @dp.callback_query(F.data == "category_premium")
 async def premium(callback: CallbackQuery):
@@ -308,6 +393,33 @@ async def premium(callback: CallbackQuery):
     await callback.answer()
 
 
+@dp.callback_query(F.data.startswith("premium_"))
+async def premium_purchase(callback: CallbackQuery):
+    months = int(callback.data.split("_")[1])
+
+    prices = {
+        3: 6400,
+        6: 8400,
+        12: 15400,
+    }
+
+    price = prices[months]
+
+    await show_payment(
+        callback.message,
+        callback.from_user.id,
+        "Telegram Premium",
+        f"{months} месяцев",
+        price
+    )
+
+    await callback.answer()
+
+
+# ==========================================
+# GRAM
+# ==========================================
+
 @dp.callback_query(F.data == "category_gram")
 async def gram(callback: CallbackQuery):
     await callback.message.edit_text(
@@ -318,9 +430,26 @@ async def gram(callback: CallbackQuery):
     await callback.answer()
 
 
-# =========================
-# ПОКУПКА
-# =========================
+@dp.callback_query(F.data.startswith("gram_"))
+async def gram_purchase(callback: CallbackQuery):
+    quantity = int(callback.data.split("_")[1])
+
+    price = quantity * 780
+
+    await show_payment(
+        callback.message,
+        callback.from_user.id,
+        "GRAM",
+        quantity,
+        price
+    )
+
+    await callback.answer()
+
+
+# ==========================================
+# СОЗДАНИЕ ЗАКАЗА
+# ==========================================
 
 async def show_payment(
     message,
@@ -349,93 +478,17 @@ async def show_payment(
     )
 
 
-# =========================
-# STARS
-# =========================
-
-@dp.callback_query(F.data.startswith("stars_"))
-async def stars_purchase(callback: CallbackQuery):
-    quantity = int(callback.data.split("_")[1])
-
-    prices = {
-        50: 420,
-        100: 840,
-        200: 1680,
-        300: 2520,
-        400: 3360,
-    }
-
-    price = prices[quantity]
-
-    await show_payment(
-        callback.message,
-        callback.from_user.id,
-        "Telegram Stars",
-        quantity,
-        price
-    )
-
-    await callback.answer()
-
-
-# =========================
-# PREMIUM
-# =========================
-
-@dp.callback_query(F.data.startswith("premium_"))
-async def premium_purchase(callback: CallbackQuery):
-    months = int(callback.data.split("_")[1])
-
-    prices = {
-        3: 6400,
-        6: 8400,
-        12: 15400,
-    }
-
-    price = prices[months]
-
-    await show_payment(
-        callback.message,
-        callback.from_user.id,
-        "Telegram Premium",
-        f"{months} месяцев",
-        price
-    )
-
-    await callback.answer()
-
-
-# =========================
-# GRAM
-# =========================
-
-@dp.callback_query(F.data.startswith("gram_"))
-async def gram_purchase(callback: CallbackQuery):
-    quantity = int(callback.data.split("_")[1])
-    price = quantity * 780
-
-    await show_payment(
-        callback.message,
-        callback.from_user.id,
-        "GRAM",
-        quantity,
-        price
-    )
-
-    await callback.answer()
-
-
-# =========================
+# ==========================================
 # СВОЁ КОЛИЧЕСТВО STARS
-# =========================
+# ==========================================
 
 @dp.callback_query(F.data == "custom_stars")
 async def custom_stars(callback: CallbackQuery, state: FSMContext):
     await state.set_state(CustomQuantity.stars)
 
     await callback.message.answer(
-        "Введите количество Stars числом.\n\n"
-        "Например: 55, 75, 101"
+        "⭐ Введите количество Stars числом.\n\n"
+        "Например: 55, 75 или 101."
     )
 
     await callback.answer()
@@ -449,8 +502,8 @@ async def custom_stars_amount(message: Message, state: FSMContext):
         if quantity <= 0:
             raise ValueError
 
-        # 8.4 ₸ за 1 Star
         raw_price = Decimal(quantity) * Decimal("8.4")
+
         price = int(
             raw_price.quantize(
                 Decimal("1"),
@@ -475,17 +528,17 @@ async def custom_stars_amount(message: Message, state: FSMContext):
         )
 
 
-# =========================
+# ==========================================
 # СВОЁ КОЛИЧЕСТВО GRAM
-# =========================
+# ==========================================
 
 @dp.callback_query(F.data == "custom_gram")
 async def custom_gram(callback: CallbackQuery, state: FSMContext):
     await state.set_state(CustomQuantity.gram)
 
     await callback.message.answer(
-        "Введите количество GRAM числом.\n\n"
-        "Например: 4, 5, 10"
+        "💠 Введите количество GRAM числом.\n\n"
+        "Например: 4, 5 или 10."
     )
 
     await callback.answer()
@@ -518,9 +571,9 @@ async def custom_gram_amount(message: Message, state: FSMContext):
         )
 
 
-# =========================
+# ==========================================
 # Я ОПЛАТИЛ
-# =========================
+# ==========================================
 
 @dp.callback_query(F.data.startswith("paid_"))
 async def paid(callback: CallbackQuery):
@@ -553,9 +606,9 @@ async def paid(callback: CallbackQuery):
     await callback.answer()
 
 
-# =========================
+# ==========================================
 # ЧЕК
-# =========================
+# ==========================================
 
 @dp.message(F.photo)
 async def receipt(message: Message):
@@ -612,9 +665,9 @@ async def receipt(message: Message):
     )
 
 
-# =========================
-# ПОДТВЕРЖДЕНИЕ АДМИНОМ
-# =========================
+# ==========================================
+# ПОДТВЕРЖДЕНИЕ
+# ==========================================
 
 @dp.callback_query(F.data.startswith("approve_"))
 async def approve(callback: CallbackQuery):
@@ -639,12 +692,19 @@ async def approve(callback: CallbackQuery):
 
     user_id = order["user_id"]
 
+    # Сообщение о подтверждении
     await bot.send_message(
         user_id,
-        f"✅ Заказ #{order_id} подтверждён.\n\n"
+        f"Заказ #{order_id} подтверждён.\n\n"
         f"Товар: {order['product']}\n"
         f"Количество: {order['quantity']}\n\n"
         "Оплата подтверждена."
+    )
+
+    # Отдельное сообщение о выдаче
+    await bot.send_message(
+        user_id,
+        "✅ Ваш заказ выдан!"
     )
 
     await callback.message.edit_caption(
@@ -658,6 +718,10 @@ async def approve(callback: CallbackQuery):
 
     await callback.answer("Заказ подтверждён.")
 
+
+# ==========================================
+# ОТКЛОНЕНИЕ
+# ==========================================
 
 @dp.callback_query(F.data.startswith("reject_"))
 async def reject(callback: CallbackQuery):
@@ -699,9 +763,9 @@ async def reject(callback: CallbackQuery):
     await callback.answer("Заказ отклонён.")
 
 
-# =========================
+# ==========================================
 # МОИ ПОКУПКИ
-# =========================
+# ==========================================
 
 @dp.callback_query(F.data == "orders")
 async def my_orders(callback: CallbackQuery):
@@ -718,16 +782,16 @@ async def my_orders(callback: CallbackQuery):
 
     text = "📦 Ваши заказы:\n\n"
 
+    status_names = {
+        "awaiting_payment": "Ожидает оплаты",
+        "waiting_receipt": "Ожидает чек",
+        "checking": "Проверяется",
+        "approved": "Подтверждён",
+        "rejected": "Отклонён",
+    }
+
     for order_id in order_ids[-10:]:
         order = orders[order_id]
-
-        status_names = {
-            "awaiting_payment": "Ожидает оплаты",
-            "waiting_receipt": "Ожидает чек",
-            "checking": "Проверяется",
-            "approved": "Подтверждён",
-            "rejected": "Отклонён",
-        }
 
         status = status_names.get(
             order["status"],
@@ -749,24 +813,81 @@ async def my_orders(callback: CallbackQuery):
     await callback.answer()
 
 
-# =========================
+# ==========================================
+# ТАБЛИЦА ЛИДЕРОВ
+# ==========================================
+
+@dp.callback_query(F.data == "leaders")
+async def leaders(callback: CallbackQuery):
+    await callback.message.edit_text(
+        "🏆 Таблица лидеров\n\n"
+        "1. Пока пусто\n"
+        "2. Пока пусто\n"
+        "3. Пока пусто\n\n"
+        "Совершайте покупки, чтобы попасть в рейтинг!",
+        reply_markup=main_keyboard()
+    )
+
+    await callback.answer()
+
+
+# ==========================================
+# ИНСТРУКЦИЯ
+# ==========================================
+
+@dp.callback_query(F.data == "instruction")
+async def instruction(callback: CallbackQuery):
+    await callback.message.edit_text(
+        "📖 Инструкция\n\n"
+        "1. Откройте «Магазин».\n"
+        "2. Выберите нужный товар.\n"
+        "3. Оплатите заказ через Kaspi.\n"
+        "4. Нажмите «Я оплатил».\n"
+        "5. Отправьте фото чека.\n"
+        "6. Дождитесь проверки оплаты.\n"
+        "7. После подтверждения получите уведомление "
+        "«Ваш заказ выдан!».\n\n"
+        "Если возникли проблемы — обратитесь в поддержку.",
+        reply_markup=main_keyboard()
+    )
+
+    await callback.answer()
+
+
+# ==========================================
 # ПОДДЕРЖКА
-# =========================
+# ==========================================
 
 @dp.callback_query(F.data == "support")
 async def support(callback: CallbackQuery):
     await callback.message.edit_text(
         "💬 Поддержка\n\n"
         "Если возникла проблема с заказом, "
-        "напишите администратору."
+        "нажмите кнопку ниже:",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="💬 Написать в поддержку",
+                        url=SUPPORT_URL
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        text="⬅️ Назад",
+                        callback_data="back"
+                    )
+                ]
+            ]
+        )
     )
 
     await callback.answer()
 
 
-# =========================
+# ==========================================
 # НАЗАД
-# =========================
+# ==========================================
 
 @dp.callback_query(F.data == "back")
 async def back(callback: CallbackQuery):
@@ -778,9 +899,9 @@ async def back(callback: CallbackQuery):
     await callback.answer()
 
 
-# =========================
+# ==========================================
 # ЗАПУСК
-# =========================
+# ==========================================
 
 async def main():
     print("Veylora Shop запущен")
