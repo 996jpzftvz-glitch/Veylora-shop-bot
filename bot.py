@@ -14,27 +14,27 @@ from aiogram.types import (
     InlineKeyboardButton,
 )
 
+
 # =========================
 # НАСТРОЙКИ
 # =========================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
-KASPI_NUMBER = os.getenv("KASPI_NUMBER", "Не указан")
-
-SHOP_NAME = "Veylora Shop"
+KASPI_NUMBER = os.getenv("KASPI_NUMBER", "")
 
 CHANNEL_URL = "https://t.me/veylorashopp"
+REVIEWS_URL = "https://t.me/veylorashopp/111"
 SUPPORT_URL = "https://t.me/srkhnv"
 
-DB_NAME = "shop.db"
-
-# ПРОМОКОД
 PROMO_CODE = "VEYLO5"
 PROMO_DISCOUNT = 5
 PROMO_LIMIT = 3
 
-bot = Bot(token=BOT_TOKEN)
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN не найден")
+
+bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
 
 
@@ -42,59 +42,59 @@ dp = Dispatcher()
 # БАЗА ДАННЫХ
 # =========================
 
-db = sqlite3.connect(DB_NAME, check_same_thread=False)
-db.row_factory = sqlite3.Row
+DB_NAME = "shop.db"
+
+
+def db():
+    return sqlite3.connect(DB_NAME)
 
 
 def init_db():
-    db.execute("""
-        CREATE TABLE IF NOT EXISTS orders (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            username TEXT,
-            product TEXT NOT NULL,
-            quantity TEXT NOT NULL,
-            price INTEGER NOT NULL,
-            status TEXT NOT NULL,
-            receipt TEXT,
-            wallet TEXT,
-            promo_code TEXT,
-            discount INTEGER DEFAULT 0,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
+    conn = db()
+    cur = conn.cursor()
 
-    db.execute("""
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY,
             username TEXT,
-            first_name TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            first_name TEXT
         )
     """)
 
-    columns = db.execute(
-        "PRAGMA table_info(orders)"
-    ).fetchall()
-
-    column_names = [column["name"] for column in columns]
-
-    if "wallet" not in column_names:
-        db.execute(
-            "ALTER TABLE orders ADD COLUMN wallet TEXT"
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS orders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            username TEXT,
+            product TEXT,
+            amount REAL,
+            price INTEGER,
+            status TEXT DEFAULT 'awaiting_payment',
+            wallet TEXT,
+            promo_code TEXT,
+            discount INTEGER DEFAULT 0
         )
+    """)
 
-    if "promo_code" not in column_names:
-        db.execute(
-            "ALTER TABLE orders ADD COLUMN promo_code TEXT"
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS favorites (
+            user_id INTEGER,
+            product TEXT,
+            UNIQUE(user_id, product)
         )
+    """)
 
-    if "discount" not in column_names:
-        db.execute(
-            "ALTER TABLE orders ADD COLUMN discount INTEGER DEFAULT 0"
-        )
+    # На случай старой базы
+    columns = [row[1] for row in cur.execute("PRAGMA table_info(orders)")]
 
-    db.commit()
+    if "promo_code" not in columns:
+        cur.execute("ALTER TABLE orders ADD COLUMN promo_code TEXT")
+
+    if "discount" not in columns:
+        cur.execute("ALTER TABLE orders ADD COLUMN discount INTEGER DEFAULT 0")
+
+    conn.commit()
+    conn.close()
 
 
 init_db()
@@ -104,224 +104,292 @@ init_db()
 # СОСТОЯНИЯ
 # =========================
 
-class CustomQuantity(StatesGroup):
-    stars = State()
-    gram = State()
-
-
-class GramWallet(StatesGroup):
-    waiting = State()
+class OrderState(StatesGroup):
+    waiting_amount = State()
+    waiting_wallet = State()
+    waiting_receipt = State()
 
 
 class PromoState(StatesGroup):
-    waiting = State()
+    waiting_code = State()
 
 
 # =========================
-# ПОЛЬЗОВАТЕЛИ
+# ЦЕНЫ
 # =========================
 
-def save_user(user):
-    db.execute("""
-        INSERT INTO users
-        (user_id, username, first_name)
+STARS = {
+    50: 420,
+    100: 840,
+    200: 1680,
+    300: 2520,
+    400: 3360,
+}
+
+PREMIUM = {
+    3: 6400,
+    6: 8400,
+    12: 15400,
+}
+
+GRAM = {
+    1: 800,
+    2: 1600,
+    3: 2400,
+}
+
+
+# =========================
+# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+# =========================
+
+def save_user(message: Message):
+    conn = db()
+    conn.execute("""
+        INSERT INTO users (user_id, username, first_name)
         VALUES (?, ?, ?)
-        ON CONFLICT(user_id)
-        DO UPDATE SET
-            username = excluded.username,
-            first_name = excluded.first_name
+        ON CONFLICT(user_id) DO UPDATE SET
+            username=excluded.username,
+            first_name=excluded.first_name
     """, (
-        user.id,
-        user.username,
-        user.first_name,
+        message.from_user.id,
+        message.from_user.username,
+        message.from_user.first_name
     ))
+    conn.commit()
+    conn.close()
 
-    db.commit()
-
-
-# =========================
-# ПРОМОКОДЫ
-# =========================
-
-def get_promo_usage():
-    row = db.execute("""
-        SELECT COUNT(*) AS count
-        FROM orders
-        WHERE promo_code = ?
-    """, (PROMO_CODE,)).fetchone()
-
-    return row["count"]
-
-
-def user_used_promo(user_id):
-    row = db.execute("""
-        SELECT id
-        FROM orders
-        WHERE user_id = ?
-        AND promo_code = ?
-        LIMIT 1
-    """, (
-        user_id,
-        PROMO_CODE
-    )).fetchone()
-
-    return row is not None
-
-
-def calculate_discount(price):
-    discount = (
-        Decimal(price)
-        * Decimal(PROMO_DISCOUNT)
-        / Decimal("100")
-    )
-
-    return int(
-        discount.quantize(
-            Decimal("1"),
-            rounding=ROUND_HALF_UP
-        )
-    )
-
-
-# =========================
-# ЗАКАЗЫ
-# =========================
 
 def create_order(
     user_id,
     username,
     product,
-    quantity,
+    amount,
     price,
     wallet=None
 ):
-    cursor = db.execute("""
+    conn = db()
+
+    cur = conn.cursor()
+
+    cur.execute("""
         INSERT INTO orders
-        (
-            user_id,
-            username,
-            product,
-            quantity,
-            price,
-            status,
-            wallet
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        (user_id, username, product, amount, price, status, wallet)
+        VALUES (?, ?, ?, ?, ?, 'awaiting_payment', ?)
     """, (
         user_id,
         username,
         product,
-        str(quantity),
+        amount,
         price,
-        "awaiting_payment",
-        wallet,
+        wallet
     ))
 
-    db.commit()
+    order_id = cur.lastrowid
 
-    return cursor.lastrowid
+    conn.commit()
+    conn.close()
+
+    return order_id
 
 
 def get_order(order_id):
-    return db.execute(
-        "SELECT * FROM orders WHERE id = ?",
-        (order_id,)
-    ).fetchone()
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT
+            id,
+            user_id,
+            username,
+            product,
+            amount,
+            price,
+            status,
+            wallet,
+            promo_code,
+            discount
+        FROM orders
+        WHERE id=?
+    """, (order_id,))
+
+    result = cur.fetchone()
+    conn.close()
+
+    return result
 
 
 def update_order_status(order_id, status):
-    db.execute(
-        "UPDATE orders SET status = ? WHERE id = ?",
-        (status, order_id)
-    )
-    db.commit()
+    conn = db()
 
-
-def save_receipt(order_id, receipt):
-    db.execute("""
+    conn.execute("""
         UPDATE orders
-        SET receipt = ?, status = ?
-        WHERE id = ?
-    """, (
-        receipt,
-        "checking",
-        order_id,
-    ))
+        SET status=?
+        WHERE id=?
+    """, (status, order_id))
 
-    db.commit()
+    conn.commit()
+    conn.close()
 
 
-def apply_promo_to_order(order_id, promo_code, discount):
-    order = get_order(order_id)
+def update_order_promo(order_id, code, discount, new_price):
+    conn = db()
 
-    if not order:
-        return False
-
-    original_price = order["price"]
-    new_price = original_price - discount
-
-    db.execute("""
+    conn.execute("""
         UPDATE orders
-        SET price = ?,
-            promo_code = ?,
-            discount = ?
-        WHERE id = ?
+        SET promo_code=?, discount=?, price=?
+        WHERE id=?
     """, (
-        new_price,
-        promo_code,
+        code,
         discount,
-        order_id,
+        new_price,
+        order_id
     ))
 
-    db.commit()
+    conn.commit()
+    conn.close()
 
-    return True
 
+def get_promo_usage():
+    conn = db()
 
-def get_user_orders(user_id):
-    return db.execute("""
-        SELECT *
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT COUNT(*)
         FROM orders
-        WHERE user_id = ?
-        ORDER BY id DESC
-        LIMIT 10
-    """, (user_id,)).fetchall()
+        WHERE promo_code=?
+    """, (PROMO_CODE,))
+
+    result = cur.fetchone()[0]
+
+    conn.close()
+
+    return result
 
 
-def get_active_user_order(user_id):
-    return db.execute("""
-        SELECT *
+def user_used_promo(user_id):
+    conn = db()
+
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT COUNT(*)
         FROM orders
-        WHERE user_id = ?
-        AND status = 'waiting_receipt'
-        ORDER BY id DESC
-        LIMIT 1
-    """, (user_id,)).fetchone()
+        WHERE user_id=? AND promo_code=?
+    """, (user_id, PROMO_CODE))
+
+    result = cur.fetchone()[0]
+
+    conn.close()
+
+    return result > 0
+
+
+def is_favorite(user_id, product):
+    conn = db()
+
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT 1
+        FROM favorites
+        WHERE user_id=? AND product=?
+    """, (user_id, product))
+
+    result = cur.fetchone() is not None
+
+    conn.close()
+
+    return result
+
+
+def add_favorite(user_id, product):
+    conn = db()
+
+    conn.execute("""
+        INSERT OR IGNORE INTO favorites
+        (user_id, product)
+        VALUES (?, ?)
+    """, (user_id, product))
+
+    conn.commit()
+    conn.close()
+
+
+def remove_favorite(user_id, product):
+    conn = db()
+
+    conn.execute("""
+        DELETE FROM favorites
+        WHERE user_id=? AND product=?
+    """, (user_id, product))
+
+    conn.commit()
+    conn.close()
+
+
+def get_favorites(user_id):
+    conn = db()
+
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT product
+        FROM favorites
+        WHERE user_id=?
+    """, (user_id,))
+
+    result = [row[0] for row in cur.fetchall()]
+
+    conn.close()
+
+    return result
+
+
+def calculate_stars_price(amount):
+    price = Decimal(str(amount)) * Decimal("8.4")
+    return int(price.quantize(
+        Decimal("1"),
+        rounding=ROUND_HALF_UP
+    ))
+
+
+def calculate_gram_price(amount):
+    return amount * 800
 
 
 # =========================
 # КЛАВИАТУРЫ
 # =========================
 
-def main_keyboard():
+def main_keyboard(user_id=None):
     buttons = [
         [
             InlineKeyboardButton(
                 text="🛍 Магазин",
                 callback_data="shop"
+            ),
+            InlineKeyboardButton(
+                text="🪽 Избранное",
+                callback_data="favorites"
             )
         ],
         [
+            InlineKeyboardButton(
+                text="✨ Отзывы",
+                url=REVIEWS_URL
+            ),
             InlineKeyboardButton(
                 text="🏆 Таблица лидеров",
                 callback_data="leaders"
-            ),
-            InlineKeyboardButton(
-                text="📖 Инструкция",
-                callback_data="instruction"
             )
         ],
         [
+            InlineKeyboardButton(
+                text="📖 Инструкция",
+                callback_data="instruction"
+            ),
             InlineKeyboardButton(
                 text="📢 Канал",
                 url=CHANNEL_URL
@@ -329,17 +397,17 @@ def main_keyboard():
         ],
         [
             InlineKeyboardButton(
-                text="📦 Мои покупки",
-                callback_data="orders"
+                text="🏦 Мои покупки",
+                callback_data="my_orders"
             ),
             InlineKeyboardButton(
                 text="💬 Поддержка",
-                callback_data="support"
+                url=SUPPORT_URL
             )
-        ],
+        ]
     ]
 
-    if ADMIN_ID:
+    if user_id == ADMIN_ID and ADMIN_ID != 0:
         buttons.append([
             InlineKeyboardButton(
                 text="⚙️ Админ-панель",
@@ -347,8 +415,19 @@ def main_keyboard():
             )
         ])
 
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def back_button():
     return InlineKeyboardMarkup(
-        inline_keyboard=buttons
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="⬅️ Назад",
+                    callback_data="back_main"
+                )
+            ]
+        ]
     )
 
 
@@ -358,157 +437,34 @@ def shop_keyboard():
             [
                 InlineKeyboardButton(
                     text="⭐ Telegram Stars",
-                    callback_data="category_stars"
+                    callback_data="stars"
                 )
             ],
             [
                 InlineKeyboardButton(
                     text="💎 Telegram Premium",
-                    callback_data="category_premium"
+                    callback_data="premium"
                 )
             ],
             [
                 InlineKeyboardButton(
                     text="💠 GRAM",
-                    callback_data="category_gram"
+                    callback_data="gram"
                 )
             ],
             [
                 InlineKeyboardButton(
                     text="⬅️ Назад",
-                    callback_data="back"
+                    callback_data="back_main"
                 )
-            ],
+            ]
         ]
     )
 
 
-def stars_keyboard():
+def receipt_keyboard(order_id):
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="50 Stars — 420 ₸",
-                    callback_data="stars_50"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="100 Stars — 840 ₸",
-                    callback_data="stars_100"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="200 Stars — 1680 ₸",
-                    callback_data="stars_200"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="300 Stars — 2520 ₸",
-                    callback_data="stars_300"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="400 Stars — 3360 ₸",
-                    callback_data="stars_400"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="✏️ Своё количество",
-                    callback_data="custom_stars"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="⬅️ Назад",
-                    callback_data="shop"
-                )
-            ],
-        ]
-    )
-
-
-def premium_keyboard():
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="3 месяца — 6400 ₸",
-                    callback_data="premium_3"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="6 месяцев — 8400 ₸",
-                    callback_data="premium_6"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="12 месяцев — 15400 ₸",
-                    callback_data="premium_12"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="⬅️ Назад",
-                    callback_data="shop"
-                )
-            ],
-        ]
-    )
-
-
-def gram_keyboard():
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="1 GRAM — 800 ₸",
-                    callback_data="gram_1"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="2 GRAM — 1600 ₸",
-                    callback_data="gram_2"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="3 GRAM — 2400 ₸",
-                    callback_data="gram_3"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="✏️ Своё количество",
-                    callback_data="custom_gram"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="⬅️ Назад",
-                    callback_data="shop"
-                )
-            ],
-        ]
-    )
-
-
-def payment_keyboard(order_id):
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="🎁 Ввести промокод",
-                    callback_data=f"promo_{order_id}"
-                )
-            ],
             [
                 InlineKeyboardButton(
                     text="💳 Я оплатил",
@@ -517,10 +473,16 @@ def payment_keyboard(order_id):
             ],
             [
                 InlineKeyboardButton(
-                    text="⬅️ В магазин",
-                    callback_data="shop"
+                    text="🎟 Промокод",
+                    callback_data=f"promo_{order_id}"
                 )
             ],
+            [
+                InlineKeyboardButton(
+                    text="⬅️ Назад",
+                    callback_data="shop"
+                )
+            ]
         ]
     )
 
@@ -530,7 +492,7 @@ def admin_order_keyboard(order_id):
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="✅ Подтвердить",
+                    text="✅ Одобрить",
                     callback_data=f"approve_{order_id}"
                 ),
                 InlineKeyboardButton(
@@ -542,70 +504,32 @@ def admin_order_keyboard(order_id):
     )
 
 
-def admin_keyboard():
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="📦 Новые заказы",
-                    callback_data="admin_new"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="💳 Ожидают оплаты",
-                    callback_data="admin_payment"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="🔎 Проверка чеков",
-                    callback_data="admin_checks"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="📊 Статистика",
-                    callback_data="admin_stats"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="👥 Пользователи",
-                    callback_data="admin_users"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="⬅️ Назад",
-                    callback_data="back"
-                )
-            ]
-        ]
-    )
-
-
-# =========================
-# ПРОВЕРКА АДМИНА
-# =========================
-
-def is_admin(user_id):
-    return user_id == ADMIN_ID
-
-
 # =========================
 # START
 # =========================
 
 @dp.message(CommandStart())
 async def start(message: Message):
-    save_user(message.from_user)
+    save_user(message)
 
     await message.answer(
-        f"Добро пожаловать в {SHOP_NAME}.\n\n"
-        "Здесь можно приобрести Telegram Stars, Premium и GRAM.\n\n"
+        "Добро пожаловать в Veylora Shop.\n\n"
         "Выберите нужный раздел:",
-        reply_markup=main_keyboard()
+        reply_markup=main_keyboard(message.from_user.id)
+    )
+
+
+# =========================
+# НАЗАД
+# =========================
+
+@dp.callback_query(F.data == "back_main")
+async def back_main(callback: CallbackQuery):
+    await callback.answer()
+
+    await callback.message.edit_text(
+        "Главное меню:",
+        reply_markup=main_keyboard(callback.from_user.id)
     )
 
 
@@ -615,356 +539,708 @@ async def start(message: Message):
 
 @dp.callback_query(F.data == "shop")
 async def shop(callback: CallbackQuery):
-    save_user(callback.from_user)
+    await callback.answer()
 
     await callback.message.edit_text(
         "🛍 Магазин\n\n"
-        "Выберите категорию:",
+        "Выберите товар:",
         reply_markup=shop_keyboard()
     )
-
-    await callback.answer()
 
 
 # =========================
 # STARS
 # =========================
 
-@dp.callback_query(F.data == "category_stars")
+@dp.callback_query(F.data == "stars")
 async def stars(callback: CallbackQuery):
+    await callback.answer()
+
+    buttons = []
+
+    for amount, price in STARS.items():
+        fav = "🪽" if is_favorite(
+            callback.from_user.id,
+            f"stars_{amount}"
+        ) else ""
+
+        buttons.append([
+            InlineKeyboardButton(
+                text=f"{fav} {amount} Stars — {price} ₸",
+                callback_data=f"buy_stars_{amount}"
+            )
+        ])
+
+    buttons.append([
+        InlineKeyboardButton(
+            text="🪽 Добавить/убрать избранное",
+            callback_data="fav_stars_menu"
+        )
+    ])
+
+    buttons.append([
+        InlineKeyboardButton(
+            text="✏️ Свое количество",
+            callback_data="custom_stars"
+        )
+    ])
+
+    buttons.append([
+        InlineKeyboardButton(
+            text="⬅️ Назад",
+            callback_data="shop"
+        )
+    ])
+
     await callback.message.edit_text(
         "⭐ Telegram Stars\n\n"
-        "Выберите количество Stars:",
-        reply_markup=stars_keyboard()
+        "Выберите количество:",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=buttons
+        )
     )
 
+
+@dp.callback_query(F.data.startswith("buy_stars_"))
+async def buy_stars(callback: CallbackQuery):
     await callback.answer()
 
+    amount = int(callback.data.split("_")[-1])
+    price = STARS[amount]
 
-@dp.callback_query(F.data.startswith("stars_"))
-async def stars_purchase(callback: CallbackQuery):
-    quantity = int(
-        callback.data.split("_")[1]
+    product = f"stars_{amount}"
+
+    favorite_text = (
+        "🪽 Убрать из избранного"
+        if is_favorite(callback.from_user.id, product)
+        else "🪽 В избранное"
     )
 
-    prices = {
-        50: 420,
-        100: 840,
-        200: 1680,
-        300: 2520,
-        400: 3360,
-    }
-
-    await show_payment(
-        callback.message,
-        callback.from_user,
-        "Telegram Stars",
-        quantity,
-        prices[quantity]
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=favorite_text,
+                    callback_data=f"togglefav_{product}"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="💳 Купить",
+                    callback_data=f"confirm_stars_{amount}"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="⬅️ Назад",
+                    callback_data="stars"
+                )
+            ]
+        ]
     )
 
+    await callback.message.edit_text(
+        f"⭐ Telegram Stars\n\n"
+        f"Количество: {amount}\n"
+        f"Цена: {price} ₸",
+        reply_markup=keyboard
+    )
+
+
+@dp.callback_query(F.data.startswith("confirm_stars_"))
+async def confirm_stars(callback: CallbackQuery):
     await callback.answer()
+
+    amount = int(callback.data.split("_")[-1])
+    price = STARS[amount]
+
+    order_id = create_order(
+        callback.from_user.id,
+        callback.from_user.username,
+        f"Telegram Stars — {amount}",
+        amount,
+        price
+    )
+
+    await callback.message.edit_text(
+        f"Заказ №{order_id}\n\n"
+        f"⭐ Telegram Stars: {amount}\n"
+        f"💰 К оплате: {price} ₸\n\n"
+        f"Оплата через Kaspi:\n"
+        f"{KASPI_NUMBER}\n\n"
+        "После оплаты нажмите «Я оплатил».",
+        reply_markup=receipt_keyboard(order_id)
+    )
+
+
+# =========================
+# CUSTOM STARS
+# =========================
+
+@dp.callback_query(F.data == "custom_stars")
+async def custom_stars(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+
+    await state.set_state(OrderState.waiting_amount)
+    await state.update_data(type="stars")
+
+    await callback.message.edit_text(
+        "Введите количество Stars числом.\n\n"
+        "Цена: 8.4 ₸ за 1 Star."
+    )
+
+
+@dp.message(OrderState.waiting_amount)
+async def custom_amount(message: Message, state: FSMContext):
+    data = await state.get_data()
+
+    try:
+        amount = int(message.text)
+    except ValueError:
+        await message.answer("Введите количество числом.")
+        return
+
+    if amount <= 0:
+        await message.answer("Количество должно быть больше 0.")
+        return
+
+    if data.get("type") == "stars":
+        price = calculate_stars_price(amount)
+
+        order_id = create_order(
+            message.from_user.id,
+            message.from_user.username,
+            f"Telegram Stars — {amount}",
+            amount,
+            price
+        )
+
+        await state.clear()
+
+        await message.answer(
+            f"Заказ №{order_id}\n\n"
+            f"⭐ Stars: {amount}\n"
+            f"💰 К оплате: {price} ₸\n\n"
+            f"Kaspi:\n{KASPI_NUMBER}\n\n"
+            "После оплаты нажмите «Я оплатил».",
+            reply_markup=receipt_keyboard(order_id)
+        )
 
 
 # =========================
 # PREMIUM
 # =========================
 
-@dp.callback_query(F.data == "category_premium")
+@dp.callback_query(F.data == "premium")
 async def premium(callback: CallbackQuery):
+    await callback.answer()
+
+    buttons = []
+
+    for months, price in PREMIUM.items():
+        product = f"premium_{months}"
+
+        fav = "🪽" if is_favorite(
+            callback.from_user.id,
+            product
+        ) else ""
+
+        buttons.append([
+            InlineKeyboardButton(
+                text=f"{fav} {months} мес. — {price} ₸",
+                callback_data=f"buy_premium_{months}"
+            )
+        ])
+
+    buttons.append([
+        InlineKeyboardButton(
+            text="⬅️ Назад",
+            callback_data="shop"
+        )
+    ])
+
     await callback.message.edit_text(
         "💎 Telegram Premium\n\n"
         "Выберите срок:",
-        reply_markup=premium_keyboard()
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=buttons
+        )
     )
 
+
+@dp.callback_query(F.data.startswith("buy_premium_"))
+async def buy_premium(callback: CallbackQuery):
     await callback.answer()
 
+    months = int(callback.data.split("_")[-1])
+    price = PREMIUM[months]
 
-@dp.callback_query(F.data.startswith("premium_"))
-async def premium_purchase(callback: CallbackQuery):
-    months = int(
-        callback.data.split("_")[1]
+    product = f"premium_{months}"
+
+    favorite_text = (
+        "🪽 Убрать из избранного"
+        if is_favorite(callback.from_user.id, product)
+        else "🪽 В избранное"
     )
 
-    prices = {
-        3: 6400,
-        6: 8400,
-        12: 15400,
-    }
-
-    await show_payment(
-        callback.message,
-        callback.from_user,
-        "Telegram Premium",
-        f"{months} месяцев",
-        prices[months]
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=favorite_text,
+                    callback_data=f"togglefav_{product}"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="💳 Купить",
+                    callback_data=f"confirm_premium_{months}"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="⬅️ Назад",
+                    callback_data="premium"
+                )
+            ]
+        ]
     )
 
+    await callback.message.edit_text(
+        f"💎 Telegram Premium\n\n"
+        f"Срок: {months} мес.\n"
+        f"Цена: {price} ₸",
+        reply_markup=keyboard
+    )
+
+
+@dp.callback_query(F.data.startswith("confirm_premium_"))
+async def confirm_premium(callback: CallbackQuery):
     await callback.answer()
+
+    months = int(callback.data.split("_")[-1])
+    price = PREMIUM[months]
+
+    order_id = create_order(
+        callback.from_user.id,
+        callback.from_user.username,
+        f"Telegram Premium — {months} мес.",
+        months,
+        price
+    )
+
+    await callback.message.edit_text(
+        f"Заказ №{order_id}\n\n"
+        f"💎 Premium: {months} мес.\n"
+        f"💰 К оплате: {price} ₸\n\n"
+        f"Kaspi:\n{KASPI_NUMBER}\n\n"
+        "После оплаты нажмите «Я оплатил».",
+        reply_markup=receipt_keyboard(order_id)
+    )
 
 
 # =========================
 # GRAM
 # =========================
 
-@dp.callback_query(F.data == "category_gram")
+@dp.callback_query(F.data == "gram")
 async def gram(callback: CallbackQuery):
+    await callback.answer()
+
+    buttons = []
+
+    for amount, price in GRAM.items():
+        product = f"gram_{amount}"
+
+        fav = "🪽" if is_favorite(
+            callback.from_user.id,
+            product
+        ) else ""
+
+        buttons.append([
+            InlineKeyboardButton(
+                text=f"{fav} {amount} GRAM — {price} ₸",
+                callback_data=f"buy_gram_{amount}"
+            )
+        ])
+
+    buttons.append([
+        InlineKeyboardButton(
+            text="✏️ Свое количество",
+            callback_data="custom_gram"
+        )
+    ])
+
+    buttons.append([
+        InlineKeyboardButton(
+            text="⬅️ Назад",
+            callback_data="shop"
+        )
+    ])
+
     await callback.message.edit_text(
         "💠 GRAM\n\n"
         "Выберите количество:",
-        reply_markup=gram_keyboard()
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=buttons
+        )
     )
 
+
+@dp.callback_query(F.data.startswith("buy_gram_"))
+async def buy_gram(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
 
+    amount = int(callback.data.split("_")[-1])
 
-@dp.callback_query(F.data.startswith("gram_"))
-async def gram_purchase(
-    callback: CallbackQuery,
-    state: FSMContext
-):
-    quantity = int(
-        callback.data.split("_")[1]
-    )
-
-    price = quantity * 800
-
+    await state.set_state(OrderState.waiting_wallet)
     await state.update_data(
-        quantity=quantity,
-        price=price
+        type="gram",
+        amount=amount
     )
 
-    await state.set_state(
-        GramWallet.waiting
+    await callback.message.edit_text(
+        f"💠 GRAM: {amount}\n\n"
+        "Введите ваш TON-кошелёк для получения GRAM:"
     )
 
-    await callback.message.answer(
-        f"💠 Покупка GRAM\n\n"
-        f"Количество: {quantity}\n"
-        f"Стоимость: {price} ₸\n\n"
-        "Введите TON-кошелёк, "
-        "на который нужно отправить GRAM:"
-    )
-
-    await callback.answer()
-
-
-# =========================
-# СВОЁ КОЛИЧЕСТВО GRAM
-# =========================
 
 @dp.callback_query(F.data == "custom_gram")
-async def custom_gram(
-    callback: CallbackQuery,
-    state: FSMContext
-):
-    await state.set_state(
-        CustomQuantity.gram
-    )
-
-    await callback.message.answer(
-        "💠 Введите количество GRAM числом.\n\n"
-        "Например: 4, 5 или 10."
-    )
-
+async def custom_gram(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
 
+    await state.set_state(OrderState.waiting_amount)
+    await state.update_data(type="gram")
 
-@dp.message(CustomQuantity.gram)
-async def custom_gram_amount(
-    message: Message,
-    state: FSMContext
-):
-    try:
-        quantity = int(
-            message.text.strip()
-        )
-
-        if quantity <= 0:
-            raise ValueError
-
-        price = quantity * 800
-
-        await state.update_data(
-            quantity=quantity,
-            price=price
-        )
-
-        await state.set_state(
-            GramWallet.waiting
-        )
-
-        await message.answer(
-            f"💠 Покупка GRAM\n\n"
-            f"Количество: {quantity}\n"
-            f"Стоимость: {price} ₸\n\n"
-            "Введите TON-кошелёк, "
-            "на который нужно отправить GRAM:"
-        )
-
-    except ValueError:
-        await message.answer(
-            "Введите целое число больше 0."
-        )
+    await callback.message.edit_text(
+        "Введите количество GRAM числом.\n\n"
+        "Цена: 800 ₸ за 1 GRAM."
+    )
 
 
-# =========================
-# TON-КОШЕЛЁК
-# =========================
-
-@dp.message(GramWallet.waiting)
-async def gram_wallet(
-    message: Message,
-    state: FSMContext
-):
+@dp.message(OrderState.waiting_wallet)
+async def wallet_received(message: Message, state: FSMContext):
     wallet = message.text.strip()
 
     if len(wallet) < 20:
         await message.answer(
-            "Похоже, кошелёк указан неправильно.\n\n"
-            "Отправьте полный TON-адрес."
+            "Похоже, кошелёк указан неправильно.\n"
+            "Отправьте TON-кошелёк ещё раз."
         )
         return
 
     data = await state.get_data()
 
-    quantity = data.get("quantity")
-    price = data.get("price")
+    amount = data["amount"]
+    price = calculate_gram_price(amount)
 
-    if not quantity or not price:
-        await state.clear()
-
-        await message.answer(
-            "Произошла ошибка. "
-            "Оформите заказ заново."
-        )
-        return
+    order_id = create_order(
+        message.from_user.id,
+        message.from_user.username,
+        f"GRAM — {amount}",
+        amount,
+        price,
+        wallet
+    )
 
     await state.clear()
 
-    await show_payment(
-        message,
-        message.from_user,
-        "GRAM",
-        quantity,
-        price,
-        wallet
+    await message.answer(
+        f"Заказ №{order_id}\n\n"
+        f"💠 GRAM: {amount}\n"
+        f"💰 К оплате: {price} ₸\n"
+        f"👛 Кошелёк: {wallet}\n\n"
+        f"Kaspi:\n{KASPI_NUMBER}\n\n"
+        "После оплаты нажмите «Я оплатил».",
+        reply_markup=receipt_keyboard(order_id)
     )
 
 
 # =========================
-# СВОЁ КОЛИЧЕСТВО STARS
+# ИЗБРАННОЕ
 # =========================
 
-@dp.callback_query(F.data == "custom_stars")
-async def custom_stars(
-    callback: CallbackQuery,
-    state: FSMContext
-):
-    await state.set_state(
-        CustomQuantity.stars
-    )
-
-    await callback.message.answer(
-        "⭐ Введите количество Stars числом.\n\n"
-        "Например: 55, 75 или 101."
-    )
-
+@dp.callback_query(F.data == "favorites")
+async def favorites(callback: CallbackQuery):
     await callback.answer()
 
+    products = get_favorites(callback.from_user.id)
 
-@dp.message(CustomQuantity.stars)
-async def custom_stars_amount(
-    message: Message,
-    state: FSMContext
-):
-    try:
-        quantity = int(
-            message.text.strip()
+    if not products:
+        await callback.message.edit_text(
+            "🪽 Избранное пока пустое.\n\n"
+            "Добавляйте товары, которые хотите быстро находить.",
+            reply_markup=back_button()
         )
+        return
 
-        if quantity <= 0:
-            raise ValueError
+    buttons = []
 
-        raw_price = (
-            Decimal(quantity)
-            * Decimal("8.4")
+    for product in products:
+        if product.startswith("stars_"):
+            amount = product.split("_")[1]
+            price = calculate_stars_price(int(amount))
+
+            buttons.append([
+                InlineKeyboardButton(
+                    text=f"⭐ Stars {amount} — {price} ₸",
+                    callback_data=f"favopen_{product}"
+                )
+            ])
+
+        elif product.startswith("premium_"):
+            months = product.split("_")[1]
+            price = PREMIUM.get(int(months), 0)
+
+            buttons.append([
+                InlineKeyboardButton(
+                    text=f"💎 Premium {months} мес. — {price} ₸",
+                    callback_data=f"favopen_{product}"
+                )
+            ])
+
+        elif product.startswith("gram_"):
+            amount = product.split("_")[1]
+            price = int(amount) * 800
+
+            buttons.append([
+                InlineKeyboardButton(
+                    text=f"💠 GRAM {amount} — {price} ₸",
+                    callback_data=f"favopen_{product}"
+                )
+            ])
+
+    buttons.append([
+        InlineKeyboardButton(
+            text="⬅️ Назад",
+            callback_data="back_main"
         )
+    ])
 
-        price = int(
-            raw_price.quantize(
-                Decimal("1"),
-                rounding=ROUND_HALF_UP
+    await callback.message.edit_text(
+        "🪽 Избранное\n\n"
+        "Ваши сохранённые товары:",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=buttons
+        )
+    )
+
+
+@dp.callback_query(F.data.startswith("togglefav_"))
+async def toggle_favorite(callback: CallbackQuery):
+    await callback.answer()
+
+    product = callback.data.replace("togglefav_", "")
+
+    if is_favorite(callback.from_user.id, product):
+        remove_favorite(callback.from_user.id, product)
+        text = "Удалено из избранного."
+    else:
+        add_favorite(callback.from_user.id, product)
+        text = "Добавлено в избранное."
+
+    await callback.answer(text)
+
+    if product.startswith("stars_"):
+        amount = int(product.split("_")[1])
+
+        await callback.message.edit_text(
+            f"⭐ Telegram Stars\n\n"
+            f"Количество: {amount}\n"
+            f"Цена: {calculate_stars_price(amount)} ₸",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(
+                            text=(
+                                "🪽 Убрать из избранного"
+                                if is_favorite(
+                                    callback.from_user.id,
+                                    product
+                                )
+                                else "🪽 В избранное"
+                            ),
+                            callback_data=f"togglefav_{product}"
+                        )
+                    ],
+                    [
+                        InlineKeyboardButton(
+                            text="💳 Купить",
+                            callback_data=f"confirm_stars_{amount}"
+                        )
+                    ],
+                    [
+                        InlineKeyboardButton(
+                            text="⬅️ Назад",
+                            callback_data="stars"
+                        )
+                    ]
+                ]
             )
         )
 
-        await state.clear()
+    elif product.startswith("premium_"):
+        months = int(product.split("_")[1])
 
-        await show_payment(
-            message,
-            message.from_user,
-            "Telegram Stars",
-            quantity,
-            price
+        await callback.message.edit_text(
+            f"💎 Telegram Premium\n\n"
+            f"Срок: {months} мес.\n"
+            f"Цена: {PREMIUM[months]} ₸",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(
+                            text=(
+                                "🪽 Убрать из избранного"
+                                if is_favorite(
+                                    callback.from_user.id,
+                                    product
+                                )
+                                else "🪽 В избранное"
+                            ),
+                            callback_data=f"togglefav_{product}"
+                        )
+                    ],
+                    [
+                        InlineKeyboardButton(
+                            text="💳 Купить",
+                            callback_data=f"confirm_premium_{months}"
+                        )
+                    ],
+                    [
+                        InlineKeyboardButton(
+                            text="⬅️ Назад",
+                            callback_data="premium"
+                        )
+                    ]
+                ]
+            )
         )
 
-    except ValueError:
-        await message.answer(
-            "Введите целое число больше 0."
+
+@dp.callback_query(F.data.startswith("favopen_"))
+async def favorite_open(callback: CallbackQuery):
+    await callback.answer()
+
+    product = callback.data.replace("favopen_", "")
+
+    if product.startswith("stars_"):
+        amount = int(product.split("_")[1])
+
+        await callback.message.edit_text(
+            f"⭐ Telegram Stars\n\n"
+            f"Количество: {amount}\n"
+            f"Цена: {calculate_stars_price(amount)} ₸",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(
+                            text="💳 Купить",
+                            callback_data=f"confirm_stars_{amount}"
+                        )
+                    ],
+                    [
+                        InlineKeyboardButton(
+                            text="🗑 Убрать из избранного",
+                            callback_data=f"togglefav_{product}"
+                        )
+                    ],
+                    [
+                        InlineKeyboardButton(
+                            text="⬅️ Назад",
+                            callback_data="favorites"
+                        )
+                    ]
+                ]
+            )
+        )
+
+    elif product.startswith("premium_"):
+        months = int(product.split("_")[1])
+
+        await callback.message.edit_text(
+            f"💎 Telegram Premium\n\n"
+            f"Срок: {months} мес.\n"
+            f"Цена: {PREMIUM[months]} ₸",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(
+                            text="💳 Купить",
+                            callback_data=f"confirm_premium_{months}"
+                        )
+                    ],
+                    [
+                        InlineKeyboardButton(
+                            text="🗑 Убрать из избранного",
+                            callback_data=f"togglefav_{product}"
+                        )
+                    ],
+                    [
+                        InlineKeyboardButton(
+                            text="⬅️ Назад",
+                            callback_data="favorites"
+                        )
+                    ]
+                ]
+            )
+        )
+
+    elif product.startswith("gram_"):
+        amount = int(product.split("_")[1])
+
+        await callback.message.edit_text(
+            f"💠 GRAM\n\n"
+            f"Количество: {amount}\n"
+            f"Цена: {amount * 800} ₸\n\n"
+            "Для покупки потребуется TON-кошелёк.",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(
+                            text="🗑 Убрать из избранного",
+                            callback_data=f"togglefav_{product}"
+                        )
+                    ],
+                    [
+                        InlineKeyboardButton(
+                            text="⬅️ Назад",
+                            callback_data="favorites"
+                        )
+                    ]
+                ]
+            )
         )
 
 
 # =========================
-# СОЗДАНИЕ ПЛАТЕЖА
+# ОТЗЫВЫ
 # =========================
 
-async def show_payment(
-    message,
-    user,
-    product,
-    quantity,
-    price,
-    wallet=None
-):
-    save_user(user)
+@dp.callback_query(F.data == "reviews")
+async def reviews(callback: CallbackQuery):
+    await callback.answer()
 
-    username = (
-        f"@{user.username}"
-        if user.username
-        else "без username"
-    )
-
-    order_id = create_order(
-        user.id,
-        username,
-        product,
-        quantity,
-        price,
-        wallet
-    )
-
-    wallet_text = ""
-
-    if wallet:
-        wallet_text = (
-            f"\n\nTON-кошелёк:\n"
-            f"{wallet}"
+    await callback.message.edit_text(
+        "✨ Отзывы Veylora Shop\n\n"
+        "Оставить отзыв можно в комментариях "
+        "под постом с отзывами:",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="—> Оставить отзыв",
+                        url=REVIEWS_URL
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        text="⬅️ Назад",
+                        callback_data="back_main"
+                    )
+                ]
+            ]
         )
-
-    await message.answer(
-        f"🧾 Заказ #{order_id}\n\n"
-        f"Товар: {product}\n"
-        f"Количество: {quantity}\n"
-        f"Стоимость: {price} ₸"
-        f"{wallet_text}\n\n"
-        f"💳 Оплата через Kaspi:\n"
-        f"{KASPI_NUMBER}\n\n"
-        "При наличии промокода нажмите "
-        "«Ввести промокод».\n\n"
-        "После перевода нажмите «Я оплатил» "
-        "и отправьте фото или PDF-чек.",
-        reply_markup=payment_keyboard(order_id)
     )
 
 
@@ -973,114 +1249,53 @@ async def show_payment(
 # =========================
 
 @dp.callback_query(F.data.startswith("promo_"))
-async def promo_start(
-    callback: CallbackQuery,
-    state: FSMContext
-):
-    order_id = int(
-        callback.data.split("_")[1]
-    )
+async def promo_start(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+
+    order_id = int(callback.data.split("_")[-1])
 
     order = get_order(order_id)
 
-    if not order:
-        await callback.answer(
-            "Заказ не найден.",
-            show_alert=True
-        )
+    if not order or order[1] != callback.from_user.id:
+        await callback.message.answer("Заказ не найден.")
         return
 
-    if order["user_id"] != callback.from_user.id:
-        await callback.answer(
-            "Это не ваш заказ.",
-            show_alert=True
-        )
-        return
-
-    if order["promo_code"]:
-        await callback.answer(
-            "Промокод уже применён.",
-            show_alert=True
-        )
-        return
-
-    if get_promo_usage() >= PROMO_LIMIT:
-        await callback.answer(
-            "Промокод уже закончился.",
-            show_alert=True
-        )
-        return
-
-    if user_used_promo(callback.from_user.id):
-        await callback.answer(
-            "Вы уже использовали этот промокод.",
-            show_alert=True
-        )
-        return
-
-    await state.set_state(
-        PromoState.waiting
-    )
-
-    await state.update_data(
-        order_id=order_id
-    )
+    await state.set_state(PromoState.waiting_code)
+    await state.update_data(order_id=order_id)
 
     await callback.message.answer(
-        "🎁 Введите промокод:"
+        "Введите промокод:"
     )
 
-    await callback.answer()
 
-
-@dp.message(PromoState.waiting)
-async def promo_enter(
-    message: Message,
-    state: FSMContext
-):
+@dp.message(PromoState.waiting_code)
+async def promo_received(message: Message, state: FSMContext):
     code = message.text.strip().upper()
 
     data = await state.get_data()
-    order_id = data.get("order_id")
-
-    if not order_id:
-        await state.clear()
-
-        await message.answer(
-            "Произошла ошибка. Оформите заказ заново."
-        )
-        return
+    order_id = data["order_id"]
 
     order = get_order(order_id)
 
     if not order:
         await state.clear()
-
-        await message.answer(
-            "Заказ не найден."
-        )
-        return
-
-    if order["user_id"] != message.from_user.id:
-        await state.clear()
-
-        await message.answer(
-            "Это не ваш заказ."
-        )
+        await message.answer("Заказ не найден.")
         return
 
     if code != PROMO_CODE:
         await message.answer(
-            "❌ Неверный промокод.\n\n"
-            "Попробуйте ещё раз."
+            "Такого промокода нет."
         )
         return
 
-    if order["promo_code"]:
+    usage = get_promo_usage()
+
+    if usage >= PROMO_LIMIT:
         await state.clear()
 
         await message.answer(
-            "Промокод уже применён к этому заказу."
+            "Этот промокод уже использовали первые "
+            f"{PROMO_LIMIT} покупателей."
         )
         return
 
@@ -1092,181 +1307,59 @@ async def promo_enter(
         )
         return
 
-    if get_promo_usage() >= PROMO_LIMIT:
-        await state.clear()
+    old_price = order[5]
 
-        await message.answer(
-            "❌ Промокод уже закончился.\n\n"
-            "Первые 3 использования уже заняты."
-        )
-        return
-
-    discount = calculate_discount(
-        order["price"]
+    new_price = int(
+        Decimal(old_price)
+        * Decimal(100 - PROMO_DISCOUNT)
+        / Decimal(100)
     )
 
-    new_price = order["price"] - discount
-
-    success = apply_promo_to_order(
+    update_order_promo(
         order_id,
         PROMO_CODE,
-        discount
+        PROMO_DISCOUNT,
+        new_price
     )
-
-    if not success:
-        await state.clear()
-
-        await message.answer(
-            "Не удалось применить промокод."
-        )
-        return
 
     await state.clear()
 
-    wallet_text = ""
-
-    if order["wallet"]:
-        wallet_text = (
-            f"\n\nTON-кошелёк:\n"
-            f"{order['wallet']}"
-        )
-
     await message.answer(
-        f"🎉 Промокод применён!\n\n"
+        f"Промокод применён.\n\n"
+        f"Старая цена: {old_price} ₸\n"
         f"Скидка: {PROMO_DISCOUNT}%\n"
-        f"Скидка в деньгах: {discount} ₸\n"
-        f"Новая стоимость: {new_price} ₸"
-        f"{wallet_text}\n\n"
-        f"💳 Оплата через Kaspi:\n"
-        f"{KASPI_NUMBER}\n\n"
-        "После оплаты нажмите «Я оплатил» "
-        "и отправьте фото или PDF-чек.",
-        reply_markup=payment_keyboard(order_id)
+        f"Новая цена: {new_price} ₸\n\n"
+        f"Kaspi:\n{KASPI_NUMBER}\n\n"
+        "После оплаты нажмите «Я оплатил».",
+        reply_markup=receipt_keyboard(order_id)
     )
 
 
 # =========================
-# Я ОПЛАТИЛ
+# ОПЛАТА
 # =========================
 
 @dp.callback_query(F.data.startswith("paid_"))
-async def paid(callback: CallbackQuery):
-    order_id = int(
-        callback.data.split("_")[1]
-    )
+async def paid(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+
+    order_id = int(callback.data.split("_")[-1])
 
     order = get_order(order_id)
 
-    if not order:
-        await callback.answer(
-            "Заказ не найден.",
-            show_alert=True
-        )
+    if not order or order[1] != callback.from_user.id:
+        await callback.message.answer("Заказ не найден.")
         return
 
-    if order["user_id"] != callback.from_user.id:
-        await callback.answer(
-            "Это не ваш заказ.",
-            show_alert=True
-        )
-        return
+    await state.set_state(OrderState.waiting_receipt)
+    await state.update_data(order_id=order_id)
 
-    update_order_status(
-        order_id,
-        "waiting_receipt"
-    )
-
-    await callback.message.answer(
-        f"Заказ #{order_id}\n\n"
-        "Теперь отправьте сюда фото чека "
-        "или PDF-файл с чеком Kaspi."
-    )
-
-    await callback.answer()
-
-
-# =========================
-# ОБЩАЯ ИНФОРМАЦИЯ О ЧЕКЕ
-# =========================
-
-async def process_receipt(
-    message: Message,
-    receipt_file_id: str,
-    receipt_type: str
-):
-    order = get_active_user_order(
-        message.from_user.id
-    )
-
-    if not order:
-        await message.answer(
-            "Сначала оформите заказ."
-        )
-        return
-
-    save_receipt(
-        order["id"],
-        receipt_file_id
-    )
-
-    username = (
-        f"@{message.from_user.username}"
-        if message.from_user.username
-        else "без username"
-    )
-
-    wallet_text = ""
-
-    if order["wallet"]:
-        wallet_text = (
-            f"\n💎 TON-кошелёк:\n"
-            f"{order['wallet']}\n"
-        )
-
-    promo_text = ""
-
-    if order["promo_code"]:
-        promo_text = (
-            f"\n🎁 Промокод: {order['promo_code']}\n"
-            f"💸 Скидка: {order['discount']} ₸\n"
-        )
-
-    admin_text = (
-        f"🧾 НОВЫЙ ЗАКАЗ #{order['id']}\n\n"
-        f"👤 Пользователь: {username}\n"
-        f"🆔 ID: {message.from_user.id}\n\n"
-        f"📦 Товар: {order['product']}\n"
-        f"🔢 Количество: {order['quantity']}\n"
-        f"💰 Сумма: {order['price']} ₸\n"
-        f"{promo_text}"
-        f"{wallet_text}\n"
-        f"📄 Тип чека: {receipt_type}\n\n"
-        "Проверьте оплату."
-    )
-
-    if receipt_type == "Фото":
-        await bot.send_photo(
-            ADMIN_ID,
-            receipt_file_id,
-            caption=admin_text,
-            reply_markup=admin_order_keyboard(
-                order["id"]
-            )
-        )
-
-    else:
-        await bot.send_document(
-            ADMIN_ID,
-            receipt_file_id,
-            caption=admin_text,
-            reply_markup=admin_order_keyboard(
-                order["id"]
-            )
-        )
-
-    await message.answer(
-        f"Чек по заказу #{order['id']} "
-        "отправлен на проверку."
+    await callback.message.edit_text(
+        f"Заказ №{order_id}\n\n"
+        "Отправьте чек об оплате.\n\n"
+        "Можно отправить:\n"
+        "• фото\n"
+        "• PDF-файл"
     )
 
 
@@ -1274,14 +1367,56 @@ async def process_receipt(
 # ЧЕК — ФОТО
 # =========================
 
-@dp.message(F.photo)
-async def receipt_photo(message: Message):
-    receipt_file_id = message.photo[-1].file_id
+@dp.message(
+    OrderState.waiting_receipt,
+    F.photo
+)
+async def receipt_photo(message: Message, state: FSMContext):
+    data = await state.get_data()
+    order_id = data["order_id"]
 
-    await process_receipt(
-        message,
-        receipt_file_id,
-        "Фото"
+    order = get_order(order_id)
+
+    if not order:
+        await state.clear()
+        await message.answer("Заказ не найден.")
+        return
+
+    update_order_status(order_id, "waiting_check")
+
+    caption = (
+        f"🧾 Новый чек\n\n"
+        f"Заказ: #{order_id}\n"
+        f"Пользователь: @{order[2] or 'нет username'}\n"
+        f"ID: {order[1]}\n"
+        f"Товар: {order[3]}\n"
+        f"Сумма: {order[5]} ₸\n"
+    )
+
+    if order[7]:
+        caption += f"Кошелёк: {order[7]}\n"
+
+    if order[8]:
+        caption += (
+            f"Промокод: {order[8]}\n"
+            f"Скидка: {order[9]}%\n"
+        )
+
+    try:
+        await bot.send_photo(
+            ADMIN_ID,
+            message.photo[-1].file_id,
+            caption=caption,
+            reply_markup=admin_order_keyboard(order_id)
+        )
+    except Exception as e:
+        print("Ошибка отправки чека админу:", e)
+
+    await state.clear()
+
+    await message.answer(
+        "Чек отправлен на проверку.\n"
+        "Ожидайте подтверждения заказа."
     )
 
 
@@ -1289,506 +1424,239 @@ async def receipt_photo(message: Message):
 # ЧЕК — PDF
 # =========================
 
-@dp.message(F.document)
-async def receipt_document(message: Message):
-    if not message.document:
-        return
-
-    mime_type = message.document.mime_type or ""
-
-    file_name = (
-        message.document.file_name
-        or ""
-    ).lower()
+@dp.message(
+    OrderState.waiting_receipt,
+    F.document
+)
+async def receipt_pdf(message: Message, state: FSMContext):
+    document = message.document
 
     is_pdf = (
-        mime_type == "application/pdf"
-        or file_name.endswith(".pdf")
+        document.mime_type == "application/pdf"
+        or (
+            document.file_name
+            and document.file_name.lower().endswith(".pdf")
+        )
     )
 
     if not is_pdf:
         await message.answer(
-            "Можно отправить только PDF-файл "
-            "или фото чека."
+            "Пожалуйста, отправьте чек в формате PDF или фото."
         )
         return
 
-    receipt_file_id = message.document.file_id
+    data = await state.get_data()
+    order_id = data["order_id"]
 
-    await process_receipt(
-        message,
-        receipt_file_id,
-        "PDF"
+    order = get_order(order_id)
+
+    if not order:
+        await state.clear()
+        await message.answer("Заказ не найден.")
+        return
+
+    update_order_status(order_id, "waiting_check")
+
+    caption = (
+        f"🧾 Новый PDF-чек\n\n"
+        f"Заказ: #{order_id}\n"
+        f"Пользователь: @{order[2] or 'нет username'}\n"
+        f"ID: {order[1]}\n"
+        f"Товар: {order[3]}\n"
+        f"Сумма: {order[5]} ₸\n"
+    )
+
+    if order[7]:
+        caption += f"Кошелёк: {order[7]}\n"
+
+    if order[8]:
+        caption += (
+            f"Промокод: {order[8]}\n"
+            f"Скидка: {order[9]}%\n"
+        )
+
+    try:
+        await bot.send_document(
+            ADMIN_ID,
+            document.file_id,
+            caption=caption,
+            reply_markup=admin_order_keyboard(order_id)
+        )
+    except Exception as e:
+        print("Ошибка отправки PDF:", e)
+
+    await state.clear()
+
+    await message.answer(
+        "PDF-чек отправлен на проверку.\n"
+        "Ожидайте подтверждения заказа."
     )
 
 
 # =========================
-# АДМИН-ПАНЕЛЬ
-# =========================
-
-@dp.callback_query(F.data == "admin")
-async def admin_panel(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        await callback.answer(
-            "Нет доступа.",
-            show_alert=True
-        )
-        return
-
-    await callback.message.edit_text(
-        "⚙️ Админ-панель\n\n"
-        "Выберите раздел:",
-        reply_markup=admin_keyboard()
-    )
-
-    await callback.answer()
-
-
-# =========================
-# НОВЫЕ ЗАКАЗЫ
-# =========================
-
-@dp.callback_query(F.data == "admin_new")
-async def admin_new(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        await callback.answer(
-            "Нет доступа.",
-            show_alert=True
-        )
-        return
-
-    rows = db.execute("""
-        SELECT *
-        FROM orders
-        ORDER BY id DESC
-        LIMIT 10
-    """).fetchall()
-
-    if not rows:
-        text = "📦 Новые заказы\n\nЗаказов пока нет."
-
-    else:
-        text = "📦 Последние заказы\n\n"
-
-        for order in rows:
-            promo_text = ""
-
-            if order["promo_code"]:
-                promo_text = (
-                    f"Промокод: {order['promo_code']}\n"
-                )
-
-            text += (
-                f"#{order['id']} — {order['product']}\n"
-                f"Количество: {order['quantity']}\n"
-                f"Сумма: {order['price']} ₸\n"
-                f"{promo_text}"
-                f"Статус: {order['status']}\n\n"
-            )
-
-    await callback.message.edit_text(
-        text,
-        reply_markup=admin_keyboard()
-    )
-
-    await callback.answer()
-
-
-# =========================
-# ОЖИДАЮТ ОПЛАТЫ
-# =========================
-
-@dp.callback_query(F.data == "admin_payment")
-async def admin_payment(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        await callback.answer(
-            "Нет доступа.",
-            show_alert=True
-        )
-        return
-
-    rows = db.execute("""
-        SELECT *
-        FROM orders
-        WHERE status = 'awaiting_payment'
-        ORDER BY id DESC
-    """).fetchall()
-
-    if not rows:
-        text = (
-            "💳 Ожидают оплаты\n\n"
-            "Таких заказов нет."
-        )
-
-    else:
-        text = "💳 Ожидают оплаты\n\n"
-
-        for order in rows:
-            promo_text = ""
-
-            if order["promo_code"]:
-                promo_text = (
-                    f"Промокод: {order['promo_code']}\n"
-                    f"Скидка: {order['discount']} ₸\n"
-                )
-
-            text += (
-                f"#{order['id']}\n"
-                f"Товар: {order['product']}\n"
-                f"Количество: {order['quantity']}\n"
-                f"Сумма: {order['price']} ₸\n"
-                f"{promo_text}\n"
-            )
-
-    await callback.message.edit_text(
-        text,
-        reply_markup=admin_keyboard()
-    )
-
-    await callback.answer()
-
-
-# =========================
-# ПРОВЕРКА ЧЕКОВ
-# =========================
-
-@dp.callback_query(F.data == "admin_checks")
-async def admin_checks(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        await callback.answer(
-            "Нет доступа.",
-            show_alert=True
-        )
-        return
-
-    rows = db.execute("""
-        SELECT *
-        FROM orders
-        WHERE status = 'checking'
-        ORDER BY id DESC
-    """).fetchall()
-
-    if not rows:
-        text = (
-            "🔎 Проверка чеков\n\n"
-            "Новых чеков нет."
-        )
-
-    else:
-        text = "🔎 Чеки на проверке\n\n"
-
-        for order in rows:
-            text += (
-                f"#{order['id']} — {order['product']}\n"
-                f"Сумма: {order['price']} ₸\n"
-                f"Пользователь: {order['username']}\n\n"
-            )
-
-    await callback.message.edit_text(
-        text,
-        reply_markup=admin_keyboard()
-    )
-
-    await callback.answer()
-
-
-# =========================
-# СТАТИСТИКА
-# =========================
-
-@dp.callback_query(F.data == "admin_stats")
-async def admin_stats(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        await callback.answer(
-            "Нет доступа.",
-            show_alert=True
-        )
-        return
-
-    users = db.execute(
-        "SELECT COUNT(*) FROM users"
-    ).fetchone()[0]
-
-    orders = db.execute(
-        "SELECT COUNT(*) FROM orders"
-    ).fetchone()[0]
-
-    approved = db.execute(
-        "SELECT COUNT(*) FROM orders WHERE status = 'approved'"
-    ).fetchone()[0]
-
-    checking = db.execute(
-        "SELECT COUNT(*) FROM orders WHERE status = 'checking'"
-    ).fetchone()[0]
-
-    waiting = db.execute(
-        "SELECT COUNT(*) FROM orders WHERE status = 'awaiting_payment'"
-    ).fetchone()[0]
-
-    revenue = db.execute(
-        "SELECT COALESCE(SUM(price), 0) "
-        "FROM orders WHERE status = 'approved'"
-    ).fetchone()[0]
-
-    promo_uses = get_promo_usage()
-
-    await callback.message.edit_text(
-        "📊 Статистика\n\n"
-        f"👥 Пользователей: {users}\n"
-        f"📦 Всего заказов: {orders}\n"
-        f"✅ Подтверждено: {approved}\n"
-        f"🔎 На проверке: {checking}\n"
-        f"💳 Ожидают оплаты: {waiting}\n\n"
-        f"💰 Подтверждено на сумму: {revenue} ₸\n\n"
-        f"🎁 Промокод {PROMO_CODE}: "
-        f"{promo_uses}/{PROMO_LIMIT}",
-        reply_markup=admin_keyboard()
-    )
-
-    await callback.answer()
-
-
-# =========================
-# ПОЛЬЗОВАТЕЛИ
-# =========================
-
-@dp.callback_query(F.data == "admin_users")
-async def admin_users(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        await callback.answer(
-            "Нет доступа.",
-            show_alert=True
-        )
-        return
-
-    users = db.execute("""
-        SELECT
-            u.user_id,
-            u.username,
-            u.first_name,
-            COUNT(o.id) AS orders_count
-        FROM users u
-        LEFT JOIN orders o
-        ON u.user_id = o.user_id
-        GROUP BY u.user_id
-        ORDER BY u.created_at DESC
-        LIMIT 20
-    """).fetchall()
-
-    if not users:
-        text = (
-            "👥 Пользователи\n\n"
-            "Пользователей пока нет."
-        )
-
-    else:
-        text = "👥 Пользователи\n\n"
-
-        for user in users:
-            username = (
-                f"@{user['username']}"
-                if user["username"]
-                else "без username"
-            )
-
-            text += (
-                f"{user['first_name'] or 'Без имени'}\n"
-                f"{username}\n"
-                f"ID: {user['user_id']}\n"
-                f"Заказов: {user['orders_count']}\n\n"
-            )
-
-    await callback.message.edit_text(
-        text,
-        reply_markup=admin_keyboard()
-    )
-
-    await callback.answer()
-
-
-# =========================
-# ПОДТВЕРЖДЕНИЕ ЗАКАЗА
+# АДМИН — ОДОБРЕНИЕ
 # =========================
 
 @dp.callback_query(F.data.startswith("approve_"))
 async def approve(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        await callback.answer(
-            "Нет доступа.",
-            show_alert=True
-        )
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("Нет доступа.")
         return
 
-    order_id = int(
-        callback.data.split("_")[1]
-    )
+    await callback.answer()
 
+    order_id = int(callback.data.split("_")[-1])
     order = get_order(order_id)
 
     if not order:
-        await callback.answer(
-            "Заказ не найден.",
-            show_alert=True
-        )
+        await callback.message.answer("Заказ не найден.")
         return
 
-    update_order_status(
-        order_id,
-        "approved"
-    )
-
-    await bot.send_message(
-        order["user_id"],
-        f"✅ Заказ #{order_id} подтверждён.\n\n"
-        f"Товар: {order['product']}\n"
-        f"Количество: {order['quantity']}\n\n"
-        "Оплата подтверждена."
-    )
-
-    await bot.send_message(
-        order["user_id"],
-        "📦 Ваш заказ выдан!"
-    )
+    update_order_status(order_id, "approved")
 
     try:
         await callback.message.edit_caption(
             caption=(
-                f"✅ ЗАКАЗ #{order_id} ПОДТВЕРЖДЁН\n\n"
-                f"Товар: {order['product']}\n"
-                f"Количество: {order['quantity']}\n"
-                f"Сумма: {order['price']} ₸"
+                f"✅ Заказ #{order_id} одобрен\n\n"
+                f"Товар: {order[3]}\n"
+                f"Сумма: {order[5]} ₸"
             )
         )
     except Exception:
-        await callback.message.edit_text(
-            f"✅ ЗАКАЗ #{order_id} ПОДТВЕРЖДЁН\n\n"
-            f"Товар: {order['product']}\n"
-            f"Количество: {order['quantity']}\n"
-            f"Сумма: {order['price']} ₸"
-        )
+        try:
+            await callback.message.edit_text(
+                f"✅ Заказ #{order_id} одобрен\n\n"
+                f"Товар: {order[3]}\n"
+                f"Сумма: {order[5]} ₸"
+            )
+        except Exception:
+            pass
 
-    await callback.answer(
-        "Заказ подтверждён."
-    )
+    try:
+        await bot.send_message(
+            order[1],
+            "✅ Заказ успешно обработан!\n\n"
+            "Спасибо за покупку в Veylora Shop.\n\n"
+            "Будем очень благодарны за отзыв:",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(
+                            text="—> Оставить отзыв",
+                            url=REVIEWS_URL
+                        )
+                    ]
+                ]
+            )
+        )
+    except Exception as e:
+        print("Ошибка уведомления пользователя:", e)
 
 
 # =========================
-# ОТКЛОНЕНИЕ
+# АДМИН — ОТКЛОНЕНИЕ
 # =========================
 
 @dp.callback_query(F.data.startswith("reject_"))
 async def reject(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        await callback.answer(
-            "Нет доступа.",
-            show_alert=True
-        )
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("Нет доступа.")
         return
 
-    order_id = int(
-        callback.data.split("_")[1]
-    )
+    await callback.answer()
 
+    order_id = int(callback.data.split("_")[-1])
     order = get_order(order_id)
 
     if not order:
-        await callback.answer(
-            "Заказ не найден.",
-            show_alert=True
-        )
+        await callback.message.answer("Заказ не найден.")
         return
 
-    update_order_status(
-        order_id,
-        "rejected"
-    )
-
-    await bot.send_message(
-        order["user_id"],
-        f"❌ Заказ #{order_id} не подтверждён.\n\n"
-        "Проверьте оплату или обратитесь в поддержку."
-    )
+    update_order_status(order_id, "rejected")
 
     try:
         await callback.message.edit_caption(
-            caption=(
-                f"❌ ЗАКАЗ #{order_id} ОТКЛОНЁН\n\n"
-                f"Товар: {order['product']}\n"
-                f"Сумма: {order['price']} ₸"
-            )
+            caption=f"❌ Заказ #{order_id} отклонён."
         )
     except Exception:
-        await callback.message.edit_text(
-            f"❌ ЗАКАЗ #{order_id} ОТКЛОНЁН\n\n"
-            f"Товар: {order['product']}\n"
-            f"Сумма: {order['price']} ₸"
-        )
+        try:
+            await callback.message.edit_text(
+                f"❌ Заказ #{order_id} отклонён."
+            )
+        except Exception:
+            pass
 
-    await callback.answer(
-        "Заказ отклонён."
-    )
+    try:
+        await bot.send_message(
+            order[1],
+            f"❌ Заказ №{order_id} отклонён.\n\n"
+            "Если произошла ошибка, обратитесь в поддержку.",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(
+                            text="💬 Поддержка",
+                            url=SUPPORT_URL
+                        )
+                    ]
+                ]
+            )
+        )
+    except Exception as e:
+        print("Ошибка уведомления:", e)
 
 
 # =========================
 # МОИ ПОКУПКИ
 # =========================
 
-@dp.callback_query(F.data == "orders")
+@dp.callback_query(F.data == "my_orders")
 async def my_orders(callback: CallbackQuery):
-    rows = get_user_orders(
-        callback.from_user.id
-    )
+    await callback.answer()
 
-    if not rows:
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT id, product, price, status
+        FROM orders
+        WHERE user_id=?
+        ORDER BY id DESC
+        LIMIT 10
+    """, (callback.from_user.id,))
+
+    orders = cur.fetchall()
+
+    conn.close()
+
+    if not orders:
         await callback.message.edit_text(
-            "📦 У вас пока нет заказов.",
-            reply_markup=main_keyboard()
+            "🏦 У вас пока нет покупок.",
+            reply_markup=back_button()
         )
-
-        await callback.answer()
         return
 
-    statuses = {
-        "awaiting_payment": "Ожидает оплаты",
-        "waiting_receipt": "Ожидает чек",
-        "checking": "Проверяется",
-        "approved": "Подтверждён",
-        "rejected": "Отклонён",
-    }
+    text = "🏦 Мои покупки\n\n"
 
-    text = "📦 Ваши заказы\n\n"
-
-    for order in rows:
-        text += (
-            f"#{order['id']} — {order['product']}\n"
-            f"Количество: {order['quantity']}\n"
-            f"Сумма: {order['price']} ₸\n"
-        )
-
-        if order["promo_code"]:
-            text += (
-                f"Промокод: {order['promo_code']}\n"
-                f"Скидка: {order['discount']} ₸\n"
-            )
+    for order_id, product, price, status in orders:
+        if status == "approved":
+            status_text = "обработан"
+        elif status == "rejected":
+            status_text = "отклонён"
+        elif status == "waiting_check":
+            status_text = "проверяется"
+        else:
+            status_text = "ожидает оплаты"
 
         text += (
-            f"Статус: "
-            f"{statuses.get(order['status'], order['status'])}\n"
+            f"№{order_id} — {product}\n"
+            f"{price} ₸ — {status_text}\n\n"
         )
-
-        if order["wallet"]:
-            text += (
-                f"TON-кошелёк: {order['wallet']}\n"
-            )
-
-        text += "\n"
 
     await callback.message.edit_text(
         text,
-        reply_markup=main_keyboard()
+        reply_markup=back_button()
     )
-
-    await callback.answer()
 
 
 # =========================
@@ -1797,45 +1665,44 @@ async def my_orders(callback: CallbackQuery):
 
 @dp.callback_query(F.data == "leaders")
 async def leaders(callback: CallbackQuery):
-    rows = db.execute("""
-        SELECT
-            username,
-            COUNT(*) AS purchases,
-            SUM(price) AS total
+    await callback.answer()
+
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT username, SUM(price) AS total
         FROM orders
-        WHERE status = 'approved'
+        WHERE status='approved'
         GROUP BY user_id
         ORDER BY total DESC
         LIMIT 10
-    """).fetchall()
+    """)
 
-    if not rows:
-        text = (
-            "🏆 Таблица лидеров\n\n"
-            "Пока здесь никого нет."
+    leaders_data = cur.fetchall()
+
+    conn.close()
+
+    if not leaders_data:
+        await callback.message.edit_text(
+            "🏆 Таблица лидеров пока пуста.",
+            reply_markup=back_button()
         )
+        return
 
-    else:
-        text = "🏆 Таблица лидеров\n\n"
+    text = "🏆 Таблица лидеров\n\n"
 
-        for index, user in enumerate(rows, 1):
-            username = (
-                user["username"]
-                or "без username"
-            )
+    for i, (username, total) in enumerate(leaders_data, 1):
+        name = f"@{username}" if username else "Покупатель"
 
-            text += (
-                f"{index}. {username}\n"
-                f"Покупок: {user['purchases']}\n"
-                f"Сумма: {user['total']} ₸\n\n"
-            )
+        text += (
+            f"{i}. {name} — {total} ₸\n"
+        )
 
     await callback.message.edit_text(
         text,
-        reply_markup=main_keyboard()
+        reply_markup=back_button()
     )
-
-    await callback.answer()
 
 
 # =========================
@@ -1844,69 +1711,255 @@ async def leaders(callback: CallbackQuery):
 
 @dp.callback_query(F.data == "instruction")
 async def instruction(callback: CallbackQuery):
+    await callback.answer()
+
     await callback.message.edit_text(
         "📖 Инструкция\n\n"
-        "1. Откройте «Магазин».\n"
-        "2. Выберите товар.\n"
-        "3. Для GRAM укажите TON-кошелёк.\n"
-        "4. При наличии введите промокод.\n"
-        "5. Оплатите заказ через Kaspi.\n"
-        "6. Нажмите «Я оплатил».\n"
-        "7. Отправьте фото или PDF-чек.\n"
-        "8. Дождитесь проверки.\n\n"
-        "При возникновении проблем "
-        "обратитесь в поддержку.",
-        reply_markup=main_keyboard()
+        "1. Выберите товар в магазине.\n"
+        "2. Создайте заказ.\n"
+        "3. Оплатите указанную сумму.\n"
+        "4. Нажмите «Я оплатил».\n"
+        "5. Отправьте чек — фото или PDF.\n"
+        "6. Дождитесь проверки.\n"
+        "7. После подтверждения заказ будет обработан.\n\n"
+        "По вопросам обращайтесь в поддержку.",
+        reply_markup=back_button()
     )
+
+
+# =========================
+# АДМИН-ПАНЕЛЬ
+# =========================
+
+@dp.callback_query(F.data == "admin")
+async def admin(callback: CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("Нет доступа.")
+        return
 
     await callback.answer()
 
-
-# =========================
-# ПОДДЕРЖКА
-# =========================
-
-@dp.callback_query(F.data == "support")
-async def support(callback: CallbackQuery):
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="💬 Написать в поддержку",
-                    url=SUPPORT_URL
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="⬅️ Назад",
-                    callback_data="back"
-                )
+    await callback.message.edit_text(
+        "⚙️ Админ-панель",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="📦 Новые заказы",
+                        callback_data="admin_new"
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        text="🔎 Проверка чеков",
+                        callback_data="admin_checks"
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        text="📊 Статистика",
+                        callback_data="admin_stats"
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        text="👥 Пользователи",
+                        callback_data="admin_users"
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        text="⬅️ Назад",
+                        callback_data="back_main"
+                    )
+                ]
             ]
-        ]
+        )
     )
 
-    await callback.message.edit_text(
-        "💬 Поддержка\n\n"
-        "Если возникла проблема с заказом, "
-        "напишите в поддержку.",
-        reply_markup=keyboard
-    )
+
+@dp.callback_query(F.data == "admin_new")
+async def admin_new(callback: CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("Нет доступа.")
+        return
 
     await callback.answer()
 
+    conn = db()
+    cur = conn.cursor()
 
-# =========================
-# НАЗАД
-# =========================
+    cur.execute("""
+        SELECT id, username, product, price
+        FROM orders
+        WHERE status='awaiting_payment'
+        ORDER BY id DESC
+        LIMIT 20
+    """)
 
-@dp.callback_query(F.data == "back")
-async def back(callback: CallbackQuery):
+    orders = cur.fetchall()
+
+    conn.close()
+
+    if not orders:
+        text = "📦 Новых заказов нет."
+    else:
+        text = "📦 Новые заказы\n\n"
+
+        for order_id, username, product, price in orders:
+            text += (
+                f"#{order_id} — "
+                f"@{username or 'нет username'}\n"
+                f"{product} — {price} ₸\n\n"
+            )
+
     await callback.message.edit_text(
-        "Главное меню:",
-        reply_markup=main_keyboard()
+        text,
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="⬅️ Назад",
+                        callback_data="admin"
+                    )
+                ]
+            ]
+        )
     )
 
+
+@dp.callback_query(F.data == "admin_checks")
+async def admin_checks(callback: CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("Нет доступа.")
+        return
+
     await callback.answer()
+
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT id, username, product, price
+        FROM orders
+        WHERE status='waiting_check'
+        ORDER BY id DESC
+        LIMIT 20
+    """)
+
+    orders = cur.fetchall()
+
+    conn.close()
+
+    if not orders:
+        text = "🔎 Сейчас чеков на проверке нет."
+    else:
+        text = "🔎 Чеки на проверке\n\n"
+
+        for order_id, username, product, price in orders:
+            text += (
+                f"#{order_id} — "
+                f"@{username or 'нет username'}\n"
+                f"{product} — {price} ₸\n\n"
+            )
+
+    await callback.message.edit_text(
+        text,
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="⬅️ Назад",
+                        callback_data="admin"
+                    )
+                ]
+            ]
+        )
+    )
+
+
+@dp.callback_query(F.data == "admin_stats")
+async def admin_stats(callback: CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("Нет доступа.")
+        return
+
+    await callback.answer()
+
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute("SELECT COUNT(*) FROM users")
+    users = cur.fetchone()[0]
+
+    cur.execute("""
+        SELECT COUNT(*)
+        FROM orders
+        WHERE status='approved'
+    """)
+    approved = cur.fetchone()[0]
+
+    cur.execute("""
+        SELECT COALESCE(SUM(price), 0)
+        FROM orders
+        WHERE status='approved'
+    """)
+    revenue = cur.fetchone()[0]
+
+    conn.close()
+
+    promo_usage = get_promo_usage()
+
+    await callback.message.edit_text(
+        "📊 Статистика\n\n"
+        f"👥 Пользователей: {users}\n"
+        f"✅ Обработано заказов: {approved}\n"
+        f"💰 Выручка: {revenue} ₸\n\n"
+        f"🎟 Промокод {PROMO_CODE}: "
+        f"{promo_usage}/{PROMO_LIMIT}",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="⬅️ Назад",
+                        callback_data="admin"
+                    )
+                ]
+            ]
+        )
+    )
+
+
+@dp.callback_query(F.data == "admin_users")
+async def admin_users(callback: CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("Нет доступа.")
+        return
+
+    await callback.answer()
+
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute("SELECT COUNT(*) FROM users")
+    count = cur.fetchone()[0]
+
+    conn.close()
+
+    await callback.message.edit_text(
+        f"👥 Пользователи\n\n"
+        f"Всего пользователей: {count}",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="⬅️ Назад",
+                        callback_data="admin"
+                    )
+                ]
+            ]
+        )
+    )
 
 
 # =========================
@@ -1914,7 +1967,7 @@ async def back(callback: CallbackQuery):
 # =========================
 
 async def main():
-    print("Veylora Shop запущен")
+    print("Veylora Shop Bot запущен")
     await dp.start_polling(bot)
 
 
