@@ -57,8 +57,15 @@ def init_db():
         )
     """)
 
-    # Если база была создана старой версией бота,
-    # добавляем колонку wallet.
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            username TEXT,
+            first_name TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
     columns = db.execute(
         "PRAGMA table_info(orders)"
     ).fetchall()
@@ -90,7 +97,29 @@ class GramWallet(StatesGroup):
 
 
 # =========================
-# РАБОТА С ЗАКАЗАМИ
+# ПОЛЬЗОВАТЕЛИ
+# =========================
+
+def save_user(user):
+    db.execute("""
+        INSERT INTO users
+        (user_id, username, first_name)
+        VALUES (?, ?, ?)
+        ON CONFLICT(user_id)
+        DO UPDATE SET
+            username = excluded.username,
+            first_name = excluded.first_name
+    """, (
+        user.id,
+        user.username,
+        user.first_name,
+    ))
+
+    db.commit()
+
+
+# =========================
+# ЗАКАЗЫ
 # =========================
 
 def create_order(
@@ -101,8 +130,7 @@ def create_order(
     price,
     wallet=None
 ):
-    cursor = db.execute(
-        """
+    cursor = db.execute("""
         INSERT INTO orders
         (
             user_id,
@@ -114,17 +142,15 @@ def create_order(
             wallet
         )
         VALUES (?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            user_id,
-            username,
-            product,
-            str(quantity),
-            price,
-            "awaiting_payment",
-            wallet,
-        ),
-    )
+    """, (
+        user_id,
+        username,
+        product,
+        str(quantity),
+        price,
+        "awaiting_payment",
+        wallet,
+    ))
 
     db.commit()
 
@@ -132,69 +158,53 @@ def create_order(
 
 
 def get_order(order_id):
-    cursor = db.execute(
+    return db.execute(
         "SELECT * FROM orders WHERE id = ?",
-        (order_id,),
-    )
-
-    return cursor.fetchone()
+        (order_id,)
+    ).fetchone()
 
 
 def update_order_status(order_id, status):
     db.execute(
         "UPDATE orders SET status = ? WHERE id = ?",
-        (status, order_id),
+        (status, order_id)
     )
-
     db.commit()
 
 
 def save_receipt(order_id, receipt):
-    db.execute(
-        """
+    db.execute("""
         UPDATE orders
         SET receipt = ?, status = ?
         WHERE id = ?
-        """,
-        (
-            receipt,
-            "checking",
-            order_id,
-        ),
-    )
+    """, (
+        receipt,
+        "checking",
+        order_id,
+    ))
 
     db.commit()
 
 
 def get_user_orders(user_id):
-    cursor = db.execute(
-        """
+    return db.execute("""
         SELECT *
         FROM orders
         WHERE user_id = ?
         ORDER BY id DESC
         LIMIT 10
-        """,
-        (user_id,),
-    )
-
-    return cursor.fetchall()
+    """, (user_id,)).fetchall()
 
 
 def get_active_user_order(user_id):
-    cursor = db.execute(
-        """
+    return db.execute("""
         SELECT *
         FROM orders
         WHERE user_id = ?
         AND status = 'waiting_receipt'
         ORDER BY id DESC
         LIMIT 1
-        """,
-        (user_id,),
-    )
-
-    return cursor.fetchone()
+    """, (user_id,)).fetchone()
 
 
 # =========================
@@ -202,41 +212,51 @@ def get_active_user_order(user_id):
 # =========================
 
 def main_keyboard():
+    buttons = [
+        [
+            InlineKeyboardButton(
+                text="🛍 Магазин",
+                callback_data="shop"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text="🏆 Таблица лидеров",
+                callback_data="leaders"
+            ),
+            InlineKeyboardButton(
+                text="📖 Инструкция",
+                callback_data="instruction"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text="📢 Канал",
+                url=CHANNEL_URL
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text="📦 Мои покупки",
+                callback_data="orders"
+            ),
+            InlineKeyboardButton(
+                text="💬 Поддержка",
+                callback_data="support"
+            )
+        ],
+    ]
+
+    if ADMIN_ID:
+        buttons.append([
+            InlineKeyboardButton(
+                text="⚙️ Админ-панель",
+                callback_data="admin"
+            )
+        ])
+
     return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="🛍 Магазин",
-                    callback_data="shop"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="🏆 Таблица лидеров",
-                    callback_data="leaders"
-                ),
-                InlineKeyboardButton(
-                    text="📖 Инструкция",
-                    callback_data="instruction"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="📢 Канал",
-                    url=CHANNEL_URL
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="📦 Мои покупки",
-                    callback_data="orders"
-                ),
-                InlineKeyboardButton(
-                    text="💬 Поддержка",
-                    callback_data="support"
-                )
-            ],
-        ]
+        inline_keyboard=buttons
     )
 
 
@@ -418,10 +438,61 @@ def admin_order_keyboard(order_id):
                 InlineKeyboardButton(
                     text="❌ Отклонить",
                     callback_data=f"reject_{order_id}"
-                ),
+                )
             ]
         ]
     )
+
+
+def admin_keyboard():
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="📦 Новые заказы",
+                    callback_data="admin_new"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="💳 Ожидают оплаты",
+                    callback_data="admin_payment"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🔎 Проверка чеков",
+                    callback_data="admin_checks"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="📊 Статистика",
+                    callback_data="admin_stats"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="👥 Пользователи",
+                    callback_data="admin_users"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="⬅️ Назад",
+                    callback_data="back"
+                )
+            ]
+        ]
+    )
+
+
+# =========================
+# ПРОВЕРКА АДМИНА
+# =========================
+
+def is_admin(user_id):
+    return user_id == ADMIN_ID
 
 
 # =========================
@@ -430,6 +501,8 @@ def admin_order_keyboard(order_id):
 
 @dp.message(CommandStart())
 async def start(message: Message):
+    save_user(message.from_user)
+
     await message.answer(
         f"Добро пожаловать в {SHOP_NAME}.\n\n"
         "Здесь можно приобрести Telegram Stars, Premium и GRAM.\n\n"
@@ -444,6 +517,8 @@ async def start(message: Message):
 
 @dp.callback_query(F.data == "shop")
 async def shop(callback: CallbackQuery):
+    save_user(callback.from_user)
+
     await callback.message.edit_text(
         "🛍 Магазин\n\n"
         "Выберите категорию:",
@@ -482,14 +557,12 @@ async def stars_purchase(callback: CallbackQuery):
         400: 3360,
     }
 
-    price = prices[quantity]
-
     await show_payment(
         callback.message,
         callback.from_user,
         "Telegram Stars",
         quantity,
-        price
+        prices[quantity]
     )
 
     await callback.answer()
@@ -522,14 +595,12 @@ async def premium_purchase(callback: CallbackQuery):
         12: 15400,
     }
 
-    price = prices[months]
-
     await show_payment(
         callback.message,
         callback.from_user,
         "Telegram Premium",
         f"{months} месяцев",
-        price
+        prices[months]
     )
 
     await callback.answer()
@@ -550,47 +621,13 @@ async def gram(callback: CallbackQuery):
     await callback.answer()
 
 
-# Покупка готового количества GRAM
 @dp.callback_query(F.data.startswith("gram_"))
-async def gram_purchase(callback: CallbackQuery):
+async def gram_purchase(callback: CallbackQuery, state: FSMContext):
     quantity = int(
         callback.data.split("_")[1]
     )
 
     price = quantity * 780
-
-    # Сохраняем выбранное количество
-    # и переводим пользователя на ввод кошелька
-    await callback.message.answer(
-        f"💠 Покупка GRAM\n\n"
-        f"Количество: {quantity}\n"
-        f"Стоимость: {price} ₸\n\n"
-        "Введите ваш TON-кошелёк, "
-        "на который нужно отправить GRAM:"
-    )
-
-    await callback.bot.send_chat_action(
-        callback.from_user.id,
-        "typing"
-    )
-
-    await dp.fsm.get_context(
-        bot=bot,
-        chat_id=callback.from_user.id,
-        user_id=callback.from_user.id
-    )
-
-    # Передаём данные через FSM
-    from aiogram.fsm.context import FSMContext
-
-    state = FSMContext(
-        storage=dp.storage,
-        key=await dp.fsm.get_context(
-            bot=bot,
-            chat_id=callback.from_user.id,
-            user_id=callback.from_user.id
-        ).key
-    )
 
     await state.update_data(
         quantity=quantity,
@@ -599,6 +636,14 @@ async def gram_purchase(callback: CallbackQuery):
 
     await state.set_state(
         GramWallet.waiting
+    )
+
+    await callback.message.answer(
+        f"💠 Покупка GRAM\n\n"
+        f"Количество: {quantity}\n"
+        f"Стоимость: {price} ₸\n\n"
+        "Введите TON-кошелёк, "
+        "на который нужно отправить GRAM:"
     )
 
     await callback.answer()
@@ -640,8 +685,6 @@ async def custom_gram_amount(
 
         price = quantity * 780
 
-        await state.clear()
-
         await state.update_data(
             quantity=quantity,
             price=price
@@ -655,19 +698,18 @@ async def custom_gram_amount(
             f"💠 Покупка GRAM\n\n"
             f"Количество: {quantity}\n"
             f"Стоимость: {price} ₸\n\n"
-            "Введите ваш TON-кошелёк, "
+            "Введите TON-кошелёк, "
             "на который нужно отправить GRAM:"
         )
 
     except ValueError:
         await message.answer(
-            "Введите целое число больше 0.\n"
-            "Например: 5"
+            "Введите целое число больше 0."
         )
 
 
 # =========================
-# ПОЛУЧЕНИЕ TON-КОШЕЛЬКА
+# TON-КОШЕЛЁК
 # =========================
 
 @dp.message(GramWallet.waiting)
@@ -677,14 +719,6 @@ async def gram_wallet(
 ):
     wallet = message.text.strip()
 
-    if not wallet:
-        await message.answer(
-            "Введите TON-кошелёк."
-        )
-        return
-
-    # Простая проверка длины.
-    # Не принимает совсем короткие строки.
     if len(wallet) < 20:
         await message.answer(
             "Похоже, кошелёк указан неправильно.\n\n"
@@ -702,7 +736,7 @@ async def gram_wallet(
 
         await message.answer(
             "Произошла ошибка. "
-            "Пожалуйста, оформите заказ заново."
+            "Оформите заказ заново."
         )
         return
 
@@ -714,57 +748,7 @@ async def gram_wallet(
         "GRAM",
         quantity,
         price,
-        wallet=wallet
-    )
-
-
-# =========================
-# СОЗДАНИЕ ЗАКАЗА
-# =========================
-
-async def show_payment(
-    message,
-    user,
-    product,
-    quantity,
-    price,
-    wallet=None
-):
-    username = (
-        f"@{user.username}"
-        if user.username
-        else "без username"
-    )
-
-    order_id = create_order(
-        user_id=user.id,
-        username=username,
-        product=product,
-        quantity=quantity,
-        price=price,
-        wallet=wallet
-    )
-
-    wallet_text = ""
-
-    if wallet:
-        wallet_text = (
-            f"\n\nTON-кошелёк:\n"
-            f"`{wallet}`"
-        )
-
-    await message.answer(
-        f"🧾 Заказ #{order_id}\n\n"
-        f"Товар: {product}\n"
-        f"Количество: {quantity}\n"
-        f"Стоимость: {price} ₸"
-        f"{wallet_text}\n\n"
-        f"💳 Оплата через Kaspi:\n"
-        f"{KASPI_NUMBER}\n\n"
-        "После перевода нажмите «Я оплатил» "
-        "и отправьте фото чека.",
-        reply_markup=payment_keyboard(order_id),
-        parse_mode="Markdown"
+        wallet
     )
 
 
@@ -826,9 +810,59 @@ async def custom_stars_amount(
 
     except ValueError:
         await message.answer(
-            "Введите целое число больше 0.\n"
-            "Например: 55"
+            "Введите целое число больше 0."
         )
+
+
+# =========================
+# СОЗДАНИЕ ПЛАТЕЖА
+# =========================
+
+async def show_payment(
+    message,
+    user,
+    product,
+    quantity,
+    price,
+    wallet=None
+):
+    save_user(user)
+
+    username = (
+        f"@{user.username}"
+        if user.username
+        else "без username"
+    )
+
+    order_id = create_order(
+        user.id,
+        username,
+        product,
+        quantity,
+        price,
+        wallet
+    )
+
+    wallet_text = ""
+
+    if wallet:
+        wallet_text = (
+            f"\n\nTON-кошелёк:\n"
+            f"{wallet}"
+        )
+
+    await message.answer(
+        f"🧾 Заказ #{order_id}\n\n"
+        f"Товар: {product}\n"
+        f"Количество: {quantity}\n"
+        f"Стоимость: {price} ₸"
+        f"{wallet_text}\n\n"
+        f"💳 Оплата через Kaspi:\n"
+        f"{KASPI_NUMBER}\n\n"
+        "После перевода нажмите «Я оплатил» "
+        "и отправьте фото чека.",
+        reply_markup=payment_keyboard(order_id)
+    )
 
 
 # =========================
@@ -864,28 +898,25 @@ async def paid(callback: CallbackQuery):
 
     await callback.message.answer(
         f"Заказ #{order_id}\n\n"
-        "Теперь отправьте сюда фото чека Kaspi.\n"
-        "После проверки администратор подтвердит заказ."
+        "Теперь отправьте сюда фото чека Kaspi."
     )
 
     await callback.answer()
 
 
 # =========================
-# ПОЛУЧЕНИЕ ЧЕКА
+# ЧЕК
 # =========================
 
 @dp.message(F.photo)
 async def receipt(message: Message):
-    user_id = message.from_user.id
-
     order = get_active_user_order(
-        user_id
+        message.from_user.id
     )
 
     if not order:
         await message.answer(
-            "Сначала оформите заказ в магазине."
+            "Сначала оформите заказ."
         )
         return
 
@@ -907,18 +938,18 @@ async def receipt(message: Message):
     if order["wallet"]:
         wallet_text = (
             f"\n💎 TON-кошелёк:\n"
-            f"`{order['wallet']}`\n"
+            f"{order['wallet']}\n"
         )
 
     admin_text = (
         f"🧾 НОВЫЙ ЗАКАЗ #{order['id']}\n\n"
         f"👤 Пользователь: {username}\n"
-        f"🆔 ID: {user_id}\n\n"
+        f"🆔 ID: {message.from_user.id}\n\n"
         f"📦 Товар: {order['product']}\n"
         f"🔢 Количество: {order['quantity']}\n"
         f"💰 Сумма: {order['price']} ₸\n"
         f"{wallet_text}\n"
-        "Проверьте оплату по чеку."
+        "Проверьте оплату."
     )
 
     await bot.send_photo(
@@ -927,24 +958,285 @@ async def receipt(message: Message):
         caption=admin_text,
         reply_markup=admin_order_keyboard(
             order["id"]
-        ),
-        parse_mode="Markdown"
+        )
     )
 
     await message.answer(
         f"Чек по заказу #{order['id']} "
-        "отправлен администратору.\n\n"
-        "Ожидайте подтверждения."
+        "отправлен на проверку."
     )
 
 
 # =========================
-# ПОДТВЕРЖДЕНИЕ
+# АДМИН-ПАНЕЛЬ
+# =========================
+
+@dp.callback_query(F.data == "admin")
+async def admin_panel(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer(
+            "Нет доступа.",
+            show_alert=True
+        )
+        return
+
+    await callback.message.edit_text(
+        "⚙️ Админ-панель\n\n"
+        "Выберите раздел:",
+        reply_markup=admin_keyboard()
+    )
+
+    await callback.answer()
+
+
+# =========================
+# НОВЫЕ ЗАКАЗЫ
+# =========================
+
+@dp.callback_query(F.data == "admin_new")
+async def admin_new(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer(
+            "Нет доступа.",
+            show_alert=True
+        )
+        return
+
+    rows = db.execute("""
+        SELECT *
+        FROM orders
+        ORDER BY id DESC
+        LIMIT 10
+    """).fetchall()
+
+    if not rows:
+        text = "📦 Новые заказы\n\nЗаказов пока нет."
+
+    else:
+        text = "📦 Последние заказы\n\n"
+
+        for order in rows:
+            text += (
+                f"#{order['id']} — {order['product']}\n"
+                f"Количество: {order['quantity']}\n"
+                f"Сумма: {order['price']} ₸\n"
+                f"Статус: {order['status']}\n\n"
+            )
+
+    await callback.message.edit_text(
+        text,
+        reply_markup=admin_keyboard()
+    )
+
+    await callback.answer()
+
+
+# =========================
+# ОЖИДАЮТ ОПЛАТЫ
+# =========================
+
+@dp.callback_query(F.data == "admin_payment")
+async def admin_payment(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer(
+            "Нет доступа.",
+            show_alert=True
+        )
+        return
+
+    rows = db.execute("""
+        SELECT *
+        FROM orders
+        WHERE status = 'awaiting_payment'
+        ORDER BY id DESC
+    """).fetchall()
+
+    if not rows:
+        text = (
+            "💳 Ожидают оплаты\n\n"
+            "Таких заказов нет."
+        )
+
+    else:
+        text = "💳 Ожидают оплаты\n\n"
+
+        for order in rows:
+            text += (
+                f"#{order['id']}\n"
+                f"Товар: {order['product']}\n"
+                f"Количество: {order['quantity']}\n"
+                f"Сумма: {order['price']} ₸\n\n"
+            )
+
+    await callback.message.edit_text(
+        text,
+        reply_markup=admin_keyboard()
+    )
+
+    await callback.answer()
+
+
+# =========================
+# ПРОВЕРКА ЧЕКОВ
+# =========================
+
+@dp.callback_query(F.data == "admin_checks")
+async def admin_checks(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer(
+            "Нет доступа.",
+            show_alert=True
+        )
+        return
+
+    rows = db.execute("""
+        SELECT *
+        FROM orders
+        WHERE status = 'checking'
+        ORDER BY id DESC
+    """).fetchall()
+
+    if not rows:
+        text = (
+            "🔎 Проверка чеков\n\n"
+            "Новых чеков нет."
+        )
+
+    else:
+        text = "🔎 Чеки на проверке\n\n"
+
+        for order in rows:
+            text += (
+                f"#{order['id']} — {order['product']}\n"
+                f"Сумма: {order['price']} ₸\n"
+                f"Пользователь: {order['username']}\n\n"
+            )
+
+    await callback.message.edit_text(
+        text,
+        reply_markup=admin_keyboard()
+    )
+
+    await callback.answer()
+
+
+# =========================
+# СТАТИСТИКА
+# =========================
+
+@dp.callback_query(F.data == "admin_stats")
+async def admin_stats(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer(
+            "Нет доступа.",
+            show_alert=True
+        )
+        return
+
+    users = db.execute(
+        "SELECT COUNT(*) FROM users"
+    ).fetchone()[0]
+
+    orders = db.execute(
+        "SELECT COUNT(*) FROM orders"
+    ).fetchone()[0]
+
+    approved = db.execute(
+        "SELECT COUNT(*) FROM orders WHERE status = 'approved'"
+    ).fetchone()[0]
+
+    checking = db.execute(
+        "SELECT COUNT(*) FROM orders WHERE status = 'checking'"
+    ).fetchone()[0]
+
+    waiting = db.execute(
+        "SELECT COUNT(*) FROM orders WHERE status = 'awaiting_payment'"
+    ).fetchone()[0]
+
+    revenue = db.execute(
+        "SELECT COALESCE(SUM(price), 0) "
+        "FROM orders WHERE status = 'approved'"
+    ).fetchone()[0]
+
+    await callback.message.edit_text(
+        "📊 Статистика\n\n"
+        f"👥 Пользователей: {users}\n"
+        f"📦 Всего заказов: {orders}\n"
+        f"✅ Подтверждено: {approved}\n"
+        f"🔎 На проверке: {checking}\n"
+        f"💳 Ожидают оплаты: {waiting}\n\n"
+        f"💰 Подтверждено на сумму: {revenue} ₸",
+        reply_markup=admin_keyboard()
+    )
+
+    await callback.answer()
+
+
+# =========================
+# ПОЛЬЗОВАТЕЛИ
+# =========================
+
+@dp.callback_query(F.data == "admin_users")
+async def admin_users(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer(
+            "Нет доступа.",
+            show_alert=True
+        )
+        return
+
+    users = db.execute("""
+        SELECT
+            u.user_id,
+            u.username,
+            u.first_name,
+            COUNT(o.id) AS orders_count
+        FROM users u
+        LEFT JOIN orders o
+        ON u.user_id = o.user_id
+        GROUP BY u.user_id
+        ORDER BY u.created_at DESC
+        LIMIT 20
+    """).fetchall()
+
+    if not users:
+        text = (
+            "👥 Пользователи\n\n"
+            "Пользователей пока нет."
+        )
+
+    else:
+        text = "👥 Пользователи\n\n"
+
+        for user in users:
+            username = (
+                f"@{user['username']}"
+                if user["username"]
+                else "без username"
+            )
+
+            text += (
+                f"{user['first_name'] or 'Без имени'}\n"
+                f"{username}\n"
+                f"ID: {user['user_id']}\n"
+                f"Заказов: {user['orders_count']}\n\n"
+            )
+
+    await callback.message.edit_text(
+        text,
+        reply_markup=admin_keyboard()
+    )
+
+    await callback.answer()
+
+
+# =========================
+# ПОДТВЕРЖДЕНИЕ ЗАКАЗА
 # =========================
 
 @dp.callback_query(F.data.startswith("approve_"))
 async def approve(callback: CallbackQuery):
-    if callback.from_user.id != ADMIN_ID:
+    if not is_admin(callback.from_user.id):
         await callback.answer(
             "Нет доступа.",
             show_alert=True
@@ -969,10 +1261,8 @@ async def approve(callback: CallbackQuery):
         "approved"
     )
 
-    user_id = order["user_id"]
-
     await bot.send_message(
-        user_id,
+        order["user_id"],
         f"✅ Заказ #{order_id} подтверждён.\n\n"
         f"Товар: {order['product']}\n"
         f"Количество: {order['quantity']}\n\n"
@@ -980,7 +1270,7 @@ async def approve(callback: CallbackQuery):
     )
 
     await bot.send_message(
-        user_id,
+        order["user_id"],
         "📦 Ваш заказ выдан!"
     )
 
@@ -1004,7 +1294,7 @@ async def approve(callback: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("reject_"))
 async def reject(callback: CallbackQuery):
-    if callback.from_user.id != ADMIN_ID:
+    if not is_admin(callback.from_user.id):
         await callback.answer(
             "Нет доступа.",
             show_alert=True
@@ -1029,10 +1319,8 @@ async def reject(callback: CallbackQuery):
         "rejected"
     )
 
-    user_id = order["user_id"]
-
     await bot.send_message(
-        user_id,
+        order["user_id"],
         f"❌ Заказ #{order_id} не подтверждён.\n\n"
         "Проверьте оплату или обратитесь в поддержку."
     )
@@ -1056,11 +1344,11 @@ async def reject(callback: CallbackQuery):
 
 @dp.callback_query(F.data == "orders")
 async def my_orders(callback: CallbackQuery):
-    orders = get_user_orders(
+    rows = get_user_orders(
         callback.from_user.id
     )
 
-    if not orders:
+    if not rows:
         await callback.message.edit_text(
             "📦 У вас пока нет заказов.",
             reply_markup=main_keyboard()
@@ -1069,7 +1357,7 @@ async def my_orders(callback: CallbackQuery):
         await callback.answer()
         return
 
-    status_names = {
+    statuses = {
         "awaiting_payment": "Ожидает оплаты",
         "waiting_receipt": "Ожидает чек",
         "checking": "Проверяется",
@@ -1077,19 +1365,14 @@ async def my_orders(callback: CallbackQuery):
         "rejected": "Отклонён",
     }
 
-    text = "📦 Ваши заказы:\n\n"
+    text = "📦 Ваши заказы\n\n"
 
-    for order in orders:
-        status = status_names.get(
-            order["status"],
-            order["status"]
-        )
-
+    for order in rows:
         text += (
             f"#{order['id']} — {order['product']}\n"
             f"Количество: {order['quantity']}\n"
             f"Сумма: {order['price']} ₸\n"
-            f"Статус: {status}\n"
+            f"Статус: {statuses.get(order['status'], order['status'])}\n"
         )
 
         if order["wallet"]:
@@ -1108,12 +1391,12 @@ async def my_orders(callback: CallbackQuery):
 
 
 # =========================
-# ТАБЛИЦА ЛИДЕРОВ
+# ЛИДЕРЫ
 # =========================
 
 @dp.callback_query(F.data == "leaders")
 async def leaders(callback: CallbackQuery):
-    cursor = db.execute("""
+    rows = db.execute("""
         SELECT
             username,
             COUNT(*) AS purchases,
@@ -1123,11 +1406,9 @@ async def leaders(callback: CallbackQuery):
         GROUP BY user_id
         ORDER BY total DESC
         LIMIT 10
-    """)
+    """).fetchall()
 
-    leaders_list = cursor.fetchall()
-
-    if not leaders_list:
+    if not rows:
         text = (
             "🏆 Таблица лидеров\n\n"
             "Пока здесь никого нет."
@@ -1136,10 +1417,7 @@ async def leaders(callback: CallbackQuery):
     else:
         text = "🏆 Таблица лидеров\n\n"
 
-        for index, user in enumerate(
-            leaders_list,
-            start=1
-        ):
+        for index, user in enumerate(rows, 1):
             username = (
                 user["username"]
                 or "без username"
@@ -1168,14 +1446,14 @@ async def instruction(callback: CallbackQuery):
     await callback.message.edit_text(
         "📖 Инструкция\n\n"
         "1. Откройте «Магазин».\n"
-        "2. Выберите нужный товар.\n"
+        "2. Выберите товар.\n"
         "3. Для GRAM укажите TON-кошелёк.\n"
         "4. Оплатите заказ через Kaspi.\n"
         "5. Нажмите «Я оплатил».\n"
         "6. Отправьте фото чека.\n"
-        "7. Дождитесь проверки оплаты.\n"
-        "8. После подтверждения получите уведомление.\n\n"
-        "Если возникли проблемы — обратитесь в поддержку.",
+        "7. Дождитесь проверки.\n\n"
+        "При возникновении проблем "
+        "обратитесь в поддержку.",
         reply_markup=main_keyboard()
     )
 
@@ -1188,7 +1466,7 @@ async def instruction(callback: CallbackQuery):
 
 @dp.callback_query(F.data == "support")
 async def support(callback: CallbackQuery):
-    support_keyboard = InlineKeyboardMarkup(
+    keyboard = InlineKeyboardMarkup(
         inline_keyboard=[
             [
                 InlineKeyboardButton(
@@ -1201,7 +1479,7 @@ async def support(callback: CallbackQuery):
                     text="⬅️ Назад",
                     callback_data="back"
                 )
-            ],
+            ]
         ]
     )
 
@@ -1209,7 +1487,7 @@ async def support(callback: CallbackQuery):
         "💬 Поддержка\n\n"
         "Если возникла проблема с заказом, "
         "напишите в поддержку.",
-        reply_markup=support_keyboard
+        reply_markup=keyboard
     )
 
     await callback.answer()
@@ -1235,7 +1513,6 @@ async def back(callback: CallbackQuery):
 
 async def main():
     print("Veylora Shop запущен")
-
     await dp.start_polling(bot)
 
 
