@@ -108,7 +108,6 @@ def init_db():
         )
     """)
 
-    # Цены
     defaults = {
         "stars_50": "420",
         "stars_100": "840",
@@ -179,6 +178,90 @@ def get_price(key):
 
 
 # =========================================================
+# ПРОВЕРКА USERNAME
+# =========================================================
+
+def has_username(user):
+    """
+    Проверяет, установлен ли у пользователя Telegram username.
+    """
+    return bool(
+        user.username and
+        user.username.strip()
+    )
+
+
+def username_required_keyboard():
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="⚙️ Установить username",
+                    url="tg://settings/username"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="⬅️ Назад",
+                    callback_data="shop"
+                )
+            ]
+        ]
+    )
+
+
+async def check_username_message(message: Message):
+    """
+    Проверка username для обычного сообщения.
+    Возвращает True, если username есть.
+    """
+
+    if has_username(message.from_user):
+        return True
+
+    await message.answer(
+        "❌ Для оформления заказа необходимо "
+        "установить username в Telegram.\n\n"
+        "Ваш username нужен для идентификации заказа "
+        "и связи с вами.\n\n"
+        "Установите @username в настройках Telegram, "
+        "а затем снова оформите заказ.",
+        reply_markup=username_required_keyboard()
+    )
+
+    return False
+
+
+async def check_username_callback(callback: CallbackQuery):
+    """
+    Проверка username для callback-кнопок.
+    """
+
+    if has_username(callback.from_user):
+        return True
+
+    await callback.answer(
+        "Сначала установите username в Telegram.",
+        show_alert=True
+    )
+
+    try:
+        await callback.message.edit_text(
+            "❌ Для оформления заказа необходимо "
+            "установить username в Telegram.\n\n"
+            "Ваш username нужен для идентификации заказа "
+            "и связи с вами.\n\n"
+            "Установите @username в настройках Telegram, "
+            "а затем снова оформите заказ.",
+            reply_markup=username_required_keyboard()
+        )
+    except Exception:
+        pass
+
+    return False
+
+
+# =========================================================
 # ПОЛЬЗОВАТЕЛИ
 # =========================================================
 
@@ -214,6 +297,25 @@ def save_user(message: Message):
             message.from_user.username,
             message.from_user.first_name
         ))
+
+    conn.commit()
+    conn.close()
+
+
+def update_user_username(user):
+    """
+    Обновляет username пользователя в БД.
+    """
+    conn = db()
+
+    conn.execute("""
+        UPDATE users
+        SET username=?
+        WHERE user_id=?
+    """, (
+        user.username,
+        user.id
+    ))
 
     conn.commit()
     conn.close()
@@ -538,6 +640,10 @@ async def start(message: Message):
 async def back_main(callback: CallbackQuery):
     await callback.answer()
 
+    # Обновляем username на случай,
+    # если пользователь установил его после запуска бота.
+    update_user_username(callback.from_user)
+
     await callback.message.edit_text(
         "Главное меню:",
         reply_markup=main_keyboard(
@@ -553,6 +659,8 @@ async def back_main(callback: CallbackQuery):
 @dp.callback_query(F.data == "shop")
 async def shop(callback: CallbackQuery):
     await callback.answer()
+
+    update_user_username(callback.from_user)
 
     await callback.message.edit_text(
         "🛍 Магазин\n\n"
@@ -616,6 +724,11 @@ async def stars(callback: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("buy_stars_"))
 async def buy_stars(callback: CallbackQuery):
+    if not await check_username_callback(callback):
+        return
+
+    update_user_username(callback.from_user)
+
     await callback.answer()
 
     amount = int(
@@ -667,6 +780,11 @@ async def buy_stars(callback: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("confirm_stars_"))
 async def confirm_stars(callback: CallbackQuery):
+    if not await check_username_callback(callback):
+        return
+
+    update_user_username(callback.from_user)
+
     await callback.answer()
 
     amount = int(
@@ -699,6 +817,11 @@ async def custom_stars(
     callback: CallbackQuery,
     state: FSMContext
 ):
+    if not await check_username_callback(callback):
+        return
+
+    update_user_username(callback.from_user)
+
     await callback.answer()
 
     await state.set_state(
@@ -768,6 +891,11 @@ async def premium(callback: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("buy_premium_"))
 async def buy_premium(callback: CallbackQuery):
+    if not await check_username_callback(callback):
+        return
+
+    update_user_username(callback.from_user)
+
     await callback.answer()
 
     months = int(
@@ -817,6 +945,11 @@ async def buy_premium(callback: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("confirm_premium_"))
 async def confirm_premium(callback: CallbackQuery):
+    if not await check_username_callback(callback):
+        return
+
+    update_user_username(callback.from_user)
+
     await callback.answer()
 
     months = int(
@@ -902,6 +1035,11 @@ async def buy_gram(
     callback: CallbackQuery,
     state: FSMContext
 ):
+    if not await check_username_callback(callback):
+        return
+
+    update_user_username(callback.from_user)
+
     await callback.answer()
 
     amount = int(
@@ -929,6 +1067,11 @@ async def custom_gram(
     callback: CallbackQuery,
     state: FSMContext
 ):
+    if not await check_username_callback(callback):
+        return
+
+    update_user_username(callback.from_user)
+
     await callback.answer()
 
     await state.set_state(
@@ -954,6 +1097,12 @@ async def custom_amount(
     message: Message,
     state: FSMContext
 ):
+    if not await check_username_message(message):
+        await state.clear()
+        return
+
+    save_user(message)
+
     data = await state.get_data()
 
     try:
@@ -1021,6 +1170,12 @@ async def wallet_received(
     message: Message,
     state: FSMContext
 ):
+    if not await check_username_message(message):
+        await state.clear()
+        return
+
+    save_user(message)
+
     wallet = message.text.strip()
 
     if len(wallet) < 20:
@@ -1317,6 +1472,14 @@ async def favorite_open(callback: CallbackQuery):
             f"Цена: {price} ₸",
             reply_markup=InlineKeyboardMarkup(
                 inline_keyboard=[
+                    [
+                        InlineKeyboardButton(
+                            text="💳 Купить",
+                            callback_data=(
+                                f"buy_gram_{amount}"
+                            )
+                        )
+                    ],
                     [
                         InlineKeyboardButton(
                             text="🗑 Убрать",
@@ -1810,6 +1973,11 @@ async def my_orders(callback: CallbackQuery):
 async def repeat_order(
     callback: CallbackQuery
 ):
+    if not await check_username_callback(callback):
+        return
+
+    update_user_username(callback.from_user)
+
     await callback.answer()
 
     order_id = int(
@@ -1917,12 +2085,13 @@ async def instruction(callback: CallbackQuery):
         "📖 Инструкция\n\n"
         "1. Откройте магазин.\n"
         "2. Выберите товар.\n"
-        "3. Создайте заказ.\n"
-        "4. Оплатите указанную сумму.\n"
-        "5. Нажмите «Я оплатил».\n"
-        "6. Отправьте чек — фото или PDF.\n"
-        "7. Дождитесь проверки.\n"
-        "8. После подтверждения заказ будет обработан.\n\n"
+        "3. Убедитесь, что у вас установлен @username.\n"
+        "4. Создайте заказ.\n"
+        "5. Оплатите указанную сумму.\n"
+        "6. Нажмите «Я оплатил».\n"
+        "7. Отправьте чек — фото или PDF.\n"
+        "8. Дождитесь проверки.\n"
+        "9. После подтверждения заказ будет обработан.\n\n"
         "Также доступны:\n"
         "🪽 Избранное\n"
         "🔁 Повторная покупка\n"
