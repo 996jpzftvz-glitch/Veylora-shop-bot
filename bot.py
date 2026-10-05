@@ -27,7 +27,12 @@ CHANNEL_URL = "https://t.me/veylorashopp"
 REVIEWS_URL = "https://t.me/veylorashopp/111"
 SUPPORT_URL = "https://t.me/srkhnv"
 
-DB_NAME = "shop.db"
+# ВАЖНО:
+# База всегда находится рядом с bot.py.
+# Это позволяет не создавать новую shop.db
+# при запуске бота из другой рабочей директории.
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_NAME = os.path.join(BASE_DIR, "shop.db")
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN не найден")
@@ -60,14 +65,35 @@ class BroadcastState(StatesGroup):
 # =========================================================
 
 def db():
-    return sqlite3.connect(DB_NAME)
+    conn = sqlite3.connect(DB_NAME)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def ensure_column(conn, table, column, definition):
+    """
+    Безопасно добавляет колонку в старую базу,
+    если её ещё нет.
+    """
+    cur = conn.cursor()
+
+    cur.execute(f"PRAGMA table_info({table})")
+    columns = [row["name"] for row in cur.fetchall()]
+
+    if column not in columns:
+        cur.execute(
+            f"ALTER TABLE {table} ADD COLUMN {column} {definition}"
+        )
 
 
 def init_db():
     conn = db()
     cur = conn.cursor()
 
+    # -----------------------------------------------------
     # Пользователи
+    # -----------------------------------------------------
+
     cur.execute("""
         CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY,
@@ -76,7 +102,19 @@ def init_db():
         )
     """)
 
+    # Добавляем фамилию в старую базу,
+    # если её ещё нет.
+    ensure_column(
+        conn,
+        "users",
+        "last_name",
+        "TEXT"
+    )
+
+    # -----------------------------------------------------
     # Заказы
+    # -----------------------------------------------------
+
     cur.execute("""
         CREATE TABLE IF NOT EXISTS orders (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -91,7 +129,10 @@ def init_db():
         )
     """)
 
+    # -----------------------------------------------------
     # Избранное
+    # -----------------------------------------------------
+
     cur.execute("""
         CREATE TABLE IF NOT EXISTS favorites (
             user_id INTEGER,
@@ -100,11 +141,35 @@ def init_db():
         )
     """)
 
+    # -----------------------------------------------------
     # Настройки
+    # -----------------------------------------------------
+
     cur.execute("""
         CREATE TABLE IF NOT EXISTS settings (
             key TEXT PRIMARY KEY,
             value TEXT
+        )
+    """)
+
+    # -----------------------------------------------------
+    # ПОСТОЯННАЯ СТАТИСТИКА ПОЛЬЗОВАТЕЛЕЙ
+    # -----------------------------------------------------
+    #
+    # Здесь хранится статистика каждого пользователя:
+    #
+    # purchases_count = количество одобренных покупок
+    # total_spent     = сколько всего потратил
+    # last_purchase_at = дата последней покупки
+    #
+    # -----------------------------------------------------
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS user_stats (
+            user_id INTEGER PRIMARY KEY,
+            purchases_count INTEGER DEFAULT 0,
+            total_spent INTEGER DEFAULT 0,
+            last_purchase_at TEXT
         )
     """)
 
@@ -131,7 +196,105 @@ def init_db():
         """, (key, value))
 
     conn.commit()
+
+    # -----------------------------------------------------
+    # ВОССТАНОВЛЕНИЕ СТАТИСТИКИ
+    # -----------------------------------------------------
+    #
+    # При каждом запуске статистика сверяется с уже
+    # существующими approved-заказами.
+    #
+    # Это позволяет сохранить старую статистику даже
+    # после обновления bot.py.
+    #
+    # -----------------------------------------------------
+
+    rebuild_user_stats(conn)
+
     conn.close()
+
+
+def rebuild_user_stats(conn=None):
+    """
+    Восстанавливает user_stats на основании всех
+    уже одобренных заказов.
+
+    Это НЕ удаляет пользователей и НЕ удаляет заказы.
+    """
+
+    own_connection = False
+
+    if conn is None:
+        conn = db()
+        own_connection = True
+
+    cur = conn.cursor()
+
+    # Создаём статистику для пользователей,
+    # у которых ещё нет записи.
+    cur.execute("""
+        INSERT OR IGNORE INTO user_stats (
+            user_id,
+            purchases_count,
+            total_spent,
+            last_purchase_at
+        )
+        SELECT
+            user_id,
+            0,
+            0,
+            NULL
+        FROM users
+    """)
+
+    # Полностью пересчитываем статистику по истории
+    # подтверждённых заказов.
+    cur.execute("""
+        UPDATE user_stats
+        SET
+            purchases_count = 0,
+            total_spent = 0,
+            last_purchase_at = NULL
+    """)
+
+    cur.execute("""
+        SELECT
+            user_id,
+            COUNT(*) AS purchases_count,
+            COALESCE(SUM(price), 0) AS total_spent,
+            MAX(created_at) AS last_purchase_at
+        FROM orders
+        WHERE status = 'approved'
+        GROUP BY user_id
+    """)
+
+    rows = cur.fetchall()
+
+    for row in rows:
+        cur.execute("""
+            INSERT INTO user_stats (
+                user_id,
+                purchases_count,
+                total_spent,
+                last_purchase_at
+            )
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(user_id)
+            DO UPDATE SET
+                purchases_count = excluded.purchases_count,
+                total_spent = excluded.total_spent,
+                last_purchase_at = excluded.last_purchase_at
+        """, (
+            row["user_id"],
+            row["purchases_count"],
+            row["total_spent"],
+            row["last_purchase_at"]
+        ))
+
+    conn.commit()
+
+    if own_connection:
+        conn.close()
 
 
 init_db()
@@ -151,12 +314,13 @@ def get_setting(key, default=None):
     )
 
     row = cur.fetchone()
+
     conn.close()
 
     if row is None:
         return default
 
-    return row[0]
+    return row["value"]
 
 
 def set_setting(key, value):
@@ -182,9 +346,6 @@ def get_price(key):
 # =========================================================
 
 def has_username(user):
-    """
-    Проверяет, установлен ли у пользователя Telegram username.
-    """
     return bool(
         user.username and
         user.username.strip()
@@ -211,11 +372,6 @@ def username_required_keyboard():
 
 
 async def check_username_message(message: Message):
-    """
-    Проверка username для обычного сообщения.
-    Возвращает True, если username есть.
-    """
-
     if has_username(message.from_user):
         return True
 
@@ -233,10 +389,6 @@ async def check_username_message(message: Message):
 
 
 async def check_username_callback(callback: CallbackQuery):
-    """
-    Проверка username для callback-кнопок.
-    """
-
     if has_username(callback.from_user):
         return True
 
@@ -266,59 +418,229 @@ async def check_username_callback(callback: CallbackQuery):
 # =========================================================
 
 def save_user(message: Message):
+    user = message.from_user
+
     conn = db()
     cur = conn.cursor()
 
     cur.execute("""
-        SELECT user_id
-        FROM users
-        WHERE user_id=?
-    """, (message.from_user.id,))
+        INSERT INTO users (
+            user_id,
+            username,
+            first_name,
+            last_name
+        )
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(user_id)
+        DO UPDATE SET
+            username = excluded.username,
+            first_name = excluded.first_name,
+            last_name = excluded.last_name
+    """, (
+        user.id,
+        user.username,
+        user.first_name,
+        user.last_name
+    ))
 
-    exists = cur.fetchone()
-
-    if exists:
-        cur.execute("""
-            UPDATE users
-            SET username=?, first_name=?
-            WHERE user_id=?
-        """, (
-            message.from_user.username,
-            message.from_user.first_name,
-            message.from_user.id
-        ))
-    else:
-        cur.execute("""
-            INSERT INTO users
-            (user_id, username, first_name)
-            VALUES (?, ?, ?)
-        """, (
-            message.from_user.id,
-            message.from_user.username,
-            message.from_user.first_name
-        ))
+    # Создаём запись постоянной статистики,
+    # если её ещё нет.
+    cur.execute("""
+        INSERT OR IGNORE INTO user_stats (
+            user_id,
+            purchases_count,
+            total_spent,
+            last_purchase_at
+        )
+        VALUES (?, 0, 0, NULL)
+    """, (user.id,))
 
     conn.commit()
     conn.close()
 
 
 def update_user_username(user):
-    """
-    Обновляет username пользователя в БД.
-    """
     conn = db()
 
     conn.execute("""
-        UPDATE users
-        SET username=?
-        WHERE user_id=?
+        INSERT INTO users (
+            user_id,
+            username,
+            first_name,
+            last_name
+        )
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(user_id)
+        DO UPDATE SET
+            username = excluded.username,
+            first_name = excluded.first_name,
+            last_name = excluded.last_name
     """, (
+        user.id,
         user.username,
-        user.id
+        user.first_name,
+        user.last_name
     ))
+
+    conn.execute("""
+        INSERT OR IGNORE INTO user_stats (
+            user_id,
+            purchases_count,
+            total_spent,
+            last_purchase_at
+        )
+        VALUES (?, 0, 0, NULL)
+    """, (user.id,))
 
     conn.commit()
     conn.close()
+
+
+def get_display_name(user_id):
+    """
+    Возвращает имя пользователя БЕЗ @username.
+    """
+
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT first_name, last_name
+        FROM users
+        WHERE user_id=?
+    """, (user_id,))
+
+    row = cur.fetchone()
+
+    conn.close()
+
+    if not row:
+        return "Покупатель"
+
+    first_name = (row["first_name"] or "").strip()
+    last_name = (row["last_name"] or "").strip()
+
+    name = " ".join(
+        part for part in [first_name, last_name]
+        if part
+    ).strip()
+
+    return name or "Покупатель"
+
+
+# =========================================================
+# ПОСТОЯННАЯ СТАТИСТИКА
+# =========================================================
+
+def get_global_stats():
+    """
+    Возвращает общую статистику магазина.
+    """
+
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT COUNT(*)
+        FROM users
+    """)
+    users = cur.fetchone()[0]
+
+    cur.execute("""
+        SELECT COUNT(*)
+        FROM orders
+        WHERE status='approved'
+    """)
+    approved_orders = cur.fetchone()[0]
+
+    cur.execute("""
+        SELECT COALESCE(SUM(price), 0)
+        FROM orders
+        WHERE status='approved'
+    """)
+    revenue = cur.fetchone()[0] or 0
+
+    cur.execute("""
+        SELECT COUNT(*)
+        FROM orders
+    """)
+    all_orders = cur.fetchone()[0]
+
+    cur.execute("""
+        SELECT COUNT(*)
+        FROM orders
+        WHERE status='waiting_check'
+    """)
+    waiting_checks = cur.fetchone()[0]
+
+    conn.close()
+
+    return {
+        "users": users,
+        "all_orders": all_orders,
+        "approved_orders": approved_orders,
+        "revenue": revenue,
+        "waiting_checks": waiting_checks
+    }
+
+
+def get_user_stats(user_id):
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT
+            purchases_count,
+            total_spent,
+            last_purchase_at
+        FROM user_stats
+        WHERE user_id=?
+    """, (user_id,))
+
+    row = cur.fetchone()
+
+    conn.close()
+
+    if not row:
+        return {
+            "purchases_count": 0,
+            "total_spent": 0,
+            "last_purchase_at": None
+        }
+
+    return {
+        "purchases_count": row["purchases_count"],
+        "total_spent": row["total_spent"],
+        "last_purchase_at": row["last_purchase_at"]
+    }
+
+
+def get_all_user_stats(limit=100):
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT
+            u.user_id,
+            u.first_name,
+            u.last_name,
+            s.purchases_count,
+            s.total_spent,
+            s.last_purchase_at
+        FROM user_stats s
+        LEFT JOIN users u
+            ON u.user_id = s.user_id
+        ORDER BY
+            s.total_spent DESC,
+            s.purchases_count DESC
+        LIMIT ?
+    """, (limit,))
+
+    rows = cur.fetchall()
+
+    conn.close()
+
+    return rows
 
 
 # =========================================================
@@ -337,8 +659,7 @@ def create_order(
     cur = conn.cursor()
 
     cur.execute("""
-        INSERT INTO orders
-        (
+        INSERT INTO orders (
             user_id,
             username,
             product,
@@ -402,6 +723,94 @@ def update_order_status(order_id, status):
 
     conn.commit()
     conn.close()
+
+
+def approve_order_and_update_stats(order_id):
+    """
+    Одновременно подтверждает заказ и обновляет
+    постоянную статистику пользователя.
+
+    Возвращает False, если заказ уже был обработан.
+    """
+
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT
+            id,
+            user_id,
+            price,
+            status
+        FROM orders
+        WHERE id=?
+    """, (order_id,))
+
+    order = cur.fetchone()
+
+    if not order:
+        conn.close()
+        return None
+
+    if order["status"] == "approved":
+        conn.close()
+        return False
+
+    # Меняем статус заказа.
+    cur.execute("""
+        UPDATE orders
+        SET status='approved'
+        WHERE id=?
+    """, (order_id,))
+
+    # Создаём статистику, если пользователь новый.
+    cur.execute("""
+        INSERT OR IGNORE INTO user_stats (
+            user_id,
+            purchases_count,
+            total_spent,
+            last_purchase_at
+        )
+        VALUES (?, 0, 0, NULL)
+    """, (order["user_id"],))
+
+    # Увеличиваем количество покупок.
+    # Сумма добавляется в постоянную статистику.
+    cur.execute("""
+        UPDATE user_stats
+        SET
+            purchases_count = purchases_count + 1,
+            total_spent = total_spent + ?,
+            last_purchase_at = CURRENT_TIMESTAMP
+        WHERE user_id=?
+    """, (
+        order["price"],
+        order["user_id"]
+    ))
+
+    conn.commit()
+
+    # Получаем обновлённую статистику.
+    cur.execute("""
+        SELECT
+            purchases_count,
+            total_spent,
+            last_purchase_at
+        FROM user_stats
+        WHERE user_id=?
+    """, (order["user_id"],))
+
+    stats = cur.fetchone()
+
+    conn.close()
+
+    return {
+        "user_id": order["user_id"],
+        "price": order["price"],
+        "purchases_count": stats["purchases_count"],
+        "total_spent": stats["total_spent"],
+        "last_purchase_at": stats["last_purchase_at"]
+    }
 
 
 # =========================================================
@@ -470,7 +879,7 @@ def get_favorites(user_id):
     """, (user_id,))
 
     result = [
-        row[0]
+        row["product"]
         for row in cur.fetchall()
     ]
 
@@ -640,8 +1049,6 @@ async def start(message: Message):
 async def back_main(callback: CallbackQuery):
     await callback.answer()
 
-    # Обновляем username на случай,
-    # если пользователь установил его после запуска бота.
     update_user_username(callback.from_user)
 
     await callback.message.edit_text(
@@ -680,7 +1087,6 @@ async def stars(callback: CallbackQuery):
     buttons = []
 
     for amount in [50, 100, 200, 300, 400]:
-
         price = stars_price(amount)
 
         fav = (
@@ -1573,7 +1979,7 @@ async def paid(
         )
         return
 
-    if order[1] != callback.from_user.id:
+    if order["user_id"] != callback.from_user.id:
         await callback.message.answer(
             "Этот заказ вам не принадлежит."
         )
@@ -1728,15 +2134,15 @@ def build_admin_order_text(
 ):
     text = (
         f"{title}\n\n"
-        f"Заказ: #{order[0]}\n"
-        f"Пользователь: @{order[2] or 'нет username'}\n"
-        f"ID: {order[1]}\n"
-        f"Товар: {order[3]}\n"
-        f"Сумма: {order[5]} ₸\n"
+        f"Заказ: #{order['id']}\n"
+        f"Пользователь: @{order['username'] or 'нет username'}\n"
+        f"ID: {order['user_id']}\n"
+        f"Товар: {order['product']}\n"
+        f"Сумма: {order['price']} ₸\n"
     )
 
-    if order[7]:
-        text += f"Кошелёк: {order[7]}\n"
+    if order["wallet"]:
+        text += f"Кошелёк: {order['wallet']}\n"
 
     return text
 
@@ -1771,8 +2177,6 @@ async def approve(callback: CallbackQuery):
         )
         return
 
-    await callback.answer()
-
     order_id = int(
         callback.data.split("_")[-1]
     )
@@ -1780,42 +2184,59 @@ async def approve(callback: CallbackQuery):
     order = get_order(order_id)
 
     if not order:
-        await callback.message.answer(
+        await callback.answer(
             "Заказ не найден."
         )
         return
 
-    if order[6] == "approved":
+    # Если уже одобрен — повторно статистику
+    # НЕ увеличиваем.
+    if order["status"] == "approved":
         await callback.answer(
             "Заказ уже обработан."
         )
         return
 
-    update_order_status(
-        order_id,
-        "approved"
+    result = approve_order_and_update_stats(
+        order_id
+    )
+
+    if result is False:
+        await callback.answer(
+            "Заказ уже обработан."
+        )
+        return
+
+    if result is None:
+        await callback.answer(
+            "Заказ не найден."
+        )
+        return
+
+    await callback.answer(
+        "Заказ одобрен."
     )
 
     try:
         await callback.message.edit_caption(
             caption=(
                 f"✅ Заказ #{order_id} одобрен\n\n"
-                f"Товар: {order[3]}\n"
-                f"Сумма: {order[5]} ₸"
+                f"Товар: {order['product']}\n"
+                f"Сумма: {order['price']} ₸"
             )
         )
     except Exception:
         try:
             await callback.message.edit_text(
                 f"✅ Заказ #{order_id} одобрен\n\n"
-                f"Товар: {order[3]}\n"
-                f"Сумма: {order[5]} ₸"
+                f"Товар: {order['product']}\n"
+                f"Сумма: {order['price']} ₸"
             )
         except Exception:
             pass
 
     await bot.send_message(
-        order[1],
+        order["user_id"],
         "✅ Заказ успешно обработан!\n\n"
         "Спасибо за покупку в Veylora Shop.\n\n"
         "Будем очень благодарны за отзыв:",
@@ -1856,6 +2277,13 @@ async def reject(callback: CallbackQuery):
     if not order:
         return
 
+    if order["status"] == "approved":
+        await callback.answer(
+            "Одобренный заказ нельзя отклонить.",
+            show_alert=True
+        )
+        return
+
     update_order_status(
         order_id,
         "rejected"
@@ -1874,7 +2302,7 @@ async def reject(callback: CallbackQuery):
             pass
 
     await bot.send_message(
-        order[1],
+        order["user_id"],
         f"❌ Заказ №{order_id} отклонён.\n\n"
         "Если произошла ошибка, обратитесь в поддержку.",
         reply_markup=InlineKeyboardMarkup(
@@ -1902,7 +2330,11 @@ async def my_orders(callback: CallbackQuery):
     cur = conn.cursor()
 
     cur.execute("""
-        SELECT id, product, price, status
+        SELECT
+            id,
+            product,
+            price,
+            status
         FROM orders
         WHERE user_id=?
         ORDER BY id DESC
@@ -1925,7 +2357,7 @@ async def my_orders(callback: CallbackQuery):
     text = "🏦 Мои покупки\n\n"
     buttons = []
 
-    for order_id, product, price, status in orders:
+    for order in orders:
 
         status_text = {
             "approved": "обработан",
@@ -1933,20 +2365,20 @@ async def my_orders(callback: CallbackQuery):
             "waiting_check": "проверяется",
             "awaiting_payment": "ожидает оплаты"
         }.get(
-            status,
-            status
+            order["status"],
+            order["status"]
         )
 
         text += (
-            f"№{order_id} — {product}\n"
-            f"{price} ₸ — {status_text}\n\n"
+            f"№{order['id']} — {order['product']}\n"
+            f"{order['price']} ₸ — {status_text}\n\n"
         )
 
-        if status == "approved":
+        if order["status"] == "approved":
             buttons.append([
                 InlineKeyboardButton(
-                    text=f"🔁 Купить снова №{order_id}",
-                    callback_data=f"repeat_{order_id}"
+                    text=f"🔁 Купить снова №{order['id']}",
+                    callback_data=f"repeat_{order['id']}"
                 )
             ])
 
@@ -1992,7 +2424,7 @@ async def repeat_order(
         )
         return
 
-    if order[1] != callback.from_user.id:
+    if order["user_id"] != callback.from_user.id:
         await callback.message.answer(
             "Этот заказ вам не принадлежит."
         )
@@ -2001,16 +2433,16 @@ async def repeat_order(
     new_order_id = create_order(
         callback.from_user.id,
         callback.from_user.username,
-        order[3],
-        order[4],
-        order[5],
-        order[7]
+        order["product"],
+        order["amount"],
+        order["price"],
+        order["wallet"]
     )
 
     await callback.message.edit_text(
         f"🔁 Новый заказ №{new_order_id}\n\n"
-        f"Товар: {order[3]}\n"
-        f"Сумма: {order[5]} ₸\n\n"
+        f"Товар: {order['product']}\n"
+        f"Сумма: {order['price']} ₸\n\n"
         f"Kaspi:\n{KASPI_NUMBER}\n\n"
         "После оплаты нажмите «Я оплатил».",
         reply_markup=receipt_keyboard(
@@ -2027,21 +2459,14 @@ async def repeat_order(
 async def leaders(callback: CallbackQuery):
     await callback.answer()
 
-    conn = db()
-    cur = conn.cursor()
+    rows = get_all_user_stats(limit=10)
 
-    cur.execute("""
-        SELECT username, SUM(price) AS total
-        FROM orders
-        WHERE status='approved'
-        GROUP BY user_id
-        ORDER BY total DESC
-        LIMIT 10
-    """)
-
-    rows = cur.fetchall()
-
-    conn.close()
+    # Показываем только пользователей,
+    # у которых есть хотя бы одна покупка.
+    rows = [
+        row for row in rows
+        if row["purchases_count"] > 0
+    ]
 
     if not rows:
         await callback.message.edit_text(
@@ -2052,19 +2477,40 @@ async def leaders(callback: CallbackQuery):
 
     text = "🏆 Таблица лидеров\n\n"
 
-    for index, (username, total) in enumerate(
-        rows,
-        1
-    ):
-        name = (
-            f"@{username}"
-            if username
-            else "Покупатель"
+    medals = {
+        1: "🥇",
+        2: "🥈",
+        3: "🥉"
+    }
+
+    for index, row in enumerate(rows, 1):
+
+        first_name = (
+            row["first_name"] or ""
+        ).strip()
+
+        last_name = (
+            row["last_name"] or ""
+        ).strip()
+
+        name = " ".join(
+            part
+            for part in [first_name, last_name]
+            if part
+        ).strip()
+
+        if not name:
+            name = "Покупатель"
+
+        prefix = medals.get(
+            index,
+            f"{index}."
         )
 
         text += (
-            f"{index}. {name} — "
-            f"{total} ₸\n"
+            f"{prefix} {name}\n"
+            f"   Покупок: {row['purchases_count']}\n"
+            f"   Потрачено: {row['total_spent']} ₸\n\n"
         )
 
     await callback.message.edit_text(
@@ -2212,7 +2658,7 @@ async def admin_orders(
     else:
         text = "🧾 Последние заказы\n\n"
 
-        for order_id, username, product, price, status in rows:
+        for row in rows:
 
             status_text = {
                 "approved": "✅",
@@ -2220,15 +2666,15 @@ async def admin_orders(
                 "waiting_check": "🔎",
                 "awaiting_payment": "⏳"
             }.get(
-                status,
+                row["status"],
                 "•"
             )
 
             text += (
-                f"{status_text} #{order_id}\n"
-                f"@{username or 'нет username'}\n"
-                f"{product}\n"
-                f"{price} ₸\n\n"
+                f"{status_text} #{row['id']}\n"
+                f"@{row['username'] or 'нет username'}\n"
+                f"{row['product']}\n"
+                f"{row['price']} ₸\n\n"
             )
 
     await callback.message.edit_text(
@@ -2286,11 +2732,11 @@ async def admin_checks(
     else:
         text = "🔎 Чеки на проверке\n\n"
 
-        for order_id, username, product, price in rows:
+        for row in rows:
             text += (
-                f"#{order_id}\n"
-                f"@{username or 'нет username'}\n"
-                f"{product} — {price} ₸\n\n"
+                f"#{row['id']}\n"
+                f"@{row['username'] or 'нет username'}\n"
+                f"{row['product']} — {row['price']} ₸\n\n"
             )
 
     await callback.message.edit_text(
@@ -2537,7 +2983,7 @@ async def edit_price_received(
 
 
 # =========================================================
-# АДМИН — СТАТИСТИКА
+# АДМИН — ПОСТОЯННАЯ СТАТИСТИКА
 # =========================================================
 
 @dp.callback_query(F.data == "admin_stats")
@@ -2552,49 +2998,132 @@ async def admin_stats(
 
     await callback.answer()
 
+    # Перед показом дополнительно синхронизируем
+    # постоянную статистику со всей историей заказов.
     conn = db()
-    cur = conn.cursor()
+    rebuild_user_stats(conn)
 
-    cur.execute(
-        "SELECT COUNT(*) FROM users"
-    )
-    users = cur.fetchone()[0]
-
-    cur.execute("""
-        SELECT COUNT(*)
-        FROM orders
-        WHERE status='approved'
-    """)
-    approved = cur.fetchone()[0]
-
-    cur.execute("""
-        SELECT COALESCE(SUM(price), 0)
-        FROM orders
-        WHERE status='approved'
-    """)
-    revenue = cur.fetchone()[0]
-
-    cur.execute("""
-        SELECT COUNT(*)
-        FROM orders
-        WHERE status='waiting_check'
-    """)
-    checks = cur.fetchone()[0]
+    stats = get_global_stats()
 
     conn.close()
 
     await callback.message.edit_text(
-        "📊 Статистика\n\n"
-        f"👥 Пользователей: {users}\n"
-        f"✅ Заказов обработано: {approved}\n"
-        f"🔎 Чеков на проверке: {checks}\n"
-        f"💰 Выручка: {revenue} ₸",
+        "📊 ПОСТОЯННАЯ СТАТИСТИКА\n\n"
+        f"👥 Всего пользователей: "
+        f"{stats['users']}\n\n"
+        f"🛍 Всего заказов: "
+        f"{stats['all_orders']}\n"
+        f"✅ Оплаченных заказов: "
+        f"{stats['approved_orders']}\n"
+        f"🔎 Чеков на проверке: "
+        f"{stats['waiting_checks']}\n\n"
+        f"💰 Общая выручка: "
+        f"{stats['revenue']} ₸\n\n"
+        "🏆 Количество покупок каждого пользователя "
+        "сохраняется отдельно.",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="🏆 Покупатели",
+                        callback_data="admin_buyer_stats"
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        text="⬅️ Назад",
+                        callback_data="admin"
+                    )
+                ]
+            ]
+        )
+    )
+
+
+# =========================================================
+# АДМИН — СТАТИСТИКА ПОКУПАТЕЛЕЙ
+# =========================================================
+
+@dp.callback_query(F.data == "admin_buyer_stats")
+async def admin_buyer_stats(
+    callback: CallbackQuery
+):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer(
+            "Нет доступа."
+        )
+        return
+
+    await callback.answer()
+
+    rows = get_all_user_stats(limit=50)
+
+    rows = [
+        row
+        for row in rows
+        if row["purchases_count"] > 0
+    ]
+
+    if not rows:
+        await callback.message.edit_text(
+            "🏆 Пока нет пользователей "
+            "с одобренными покупками.",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(
+                            text="⬅️ Назад",
+                            callback_data="admin_stats"
+                        )
+                    ]
+                ]
+            )
+        )
+        return
+
+    text = "🏆 ПОКУПАТЕЛИ\n\n"
+
+    for index, row in enumerate(rows, 1):
+
+        first_name = (
+            row["first_name"] or ""
+        ).strip()
+
+        last_name = (
+            row["last_name"] or ""
+        ).strip()
+
+        name = " ".join(
+            part
+            for part in [first_name, last_name]
+            if part
+        ).strip()
+
+        if not name:
+            name = "Покупатель"
+
+        text += (
+            f"{index}. {name}\n"
+            f"Покупок: {row['purchases_count']}\n"
+            f"Потрачено: {row['total_spent']} ₸\n"
+        )
+
+        if row["last_purchase_at"]:
+            text += (
+                f"Последняя покупка: "
+                f"{row['last_purchase_at']}\n"
+            )
+
+        text += "\n"
+
+    await callback.message.edit_text(
+        text,
         reply_markup=InlineKeyboardMarkup(
             inline_keyboard=[
                 [
                     InlineKeyboardButton(
                         text="⬅️ Назад",
-                        callback_data="admin"
+                        callback_data="admin_stats"
                     )
                 ]
             ]
@@ -2618,22 +3147,22 @@ async def admin_users(
 
     await callback.answer()
 
-    conn = db()
-    cur = conn.cursor()
-
-    cur.execute(
-        "SELECT COUNT(*) FROM users"
-    )
-
-    users = cur.fetchone()[0]
-
-    conn.close()
+    stats = get_global_stats()
 
     await callback.message.edit_text(
         "👥 Пользователи\n\n"
-        f"Всего пользователей: {users}",
+        f"Всего пользователей: "
+        f"{stats['users']}\n\n"
+        "Статистика покупателей хранится "
+        "отдельно и не сбрасывается.",
         reply_markup=InlineKeyboardMarkup(
             inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="🏆 Статистика покупателей",
+                        callback_data="admin_buyer_stats"
+                    )
+                ],
                 [
                     InlineKeyboardButton(
                         text="⬅️ Назад",
@@ -2697,7 +3226,7 @@ async def broadcast_received(
     )
 
     users = [
-        row[0]
+        row["user_id"]
         for row in cur.fetchall()
     ]
 
@@ -2751,6 +3280,7 @@ async def broadcast_received(
 
 async def main():
     print("Veylora Shop Bot запущен")
+    print(f"База данных: {DB_NAME}")
 
     await dp.start_polling(
         bot
